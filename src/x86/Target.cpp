@@ -27,6 +27,7 @@
 // LLVM headers
 #include "llvm/MC/SubtargetFeature.h"
 #include "llvm/IR/Module.h"
+#include "llvm/IR/MDBuilder.h"
 
 // System headers
 #include <gmp.h>
@@ -46,14 +47,25 @@ extern "C" {
 #include "tree.h"
 
 #include "diagnostic.h"
+#if (GCC_MAJOR > 4)
+#include "function.h"
+#include "basic-block.h"
+#include "tree-core.h"
+#include "rtl.h"
+#endif
 #include "gimple.h"
-#if (GCC_MINOR > 6)
+#if GCC_VERSION_CODE > GCC_VERSION(4, 6)
 #include "gimple-pretty-print.h"
 #endif
 #include "toplev.h"
 
-#if (GCC_MINOR == 6)
+#if (GCC_MAJOR > 4)
+struct stringop_algs;
+extern void debug_gimple_stmt(gimple *);
+#else
+#if GCC_VERSION_CODE == GCC_VERSION(4, 6)
 extern void debug_gimple_stmt(union gimple_statement_d *);
+#endif
 #endif
 
 #ifndef ENABLE_BUILD_WITH_CXX
@@ -65,17 +77,33 @@ extern void debug_gimple_stmt(union gimple_statement_d *);
 
 // One day we will do parameter marshalling right: by using CUMULATIVE_ARGS.
 // While waiting for that happy day, just include a chunk of i386.c.
+#if (GCC_MAJOR > 4)
+#if (GCC_MAJOR > 7)
+#include "memmodel.h"
+#include "tree-vrp.h"
+#endif
+#include "ABIHack6.inc"
+#else
 #include "ABIHack.inc"
+#endif
 
 using namespace llvm;
 
-static LLVMContext &Context = getGlobalContext();
+#if LLVM_VERSION_CODE < LLVM_VERSION(3, 9)
+static LLVMContext &TheContext = getGlobalContext();
+#endif
 
 /// BitCastToIntVector - Bitcast the vector operand to a vector of integers of
 //  the same length.
 static Value *BitCastToIntVector(Value *Op, LLVMBuilder &Builder) {
   VectorType *VecTy = cast<VectorType>(Op->getType());
   Type *EltTy = VecTy->getElementType();
+  LLVMContext &Context =
+#if LLVM_VERSION_CODE > LLVM_VERSION(3, 8)
+      EltTy->getContext();
+#else
+      TheContext;
+#endif
   Type *IntTy = IntegerType::get(Context, EltTy->getPrimitiveSizeInBits());
   return Builder.CreateBitCast(Op,
                                VectorType::get(IntTy, VecTy->getNumElements()));
@@ -106,9 +134,11 @@ static bool HandlerLT(const HandlerEntry &E, const HandlerEntry &F) {
  * code, emit the code now.  If we can handle the code, this macro should emit
  * the code, return true.
  */
-bool TreeToLLVM::TargetIntrinsicLower(
-    gimple stmt, tree fndecl, const MemRef */*DestLoc*/, Value *&Result,
-    Type *ResultType, std::vector<Value *> &Ops) {
+bool TreeToLLVM::TargetIntrinsicLower(GimpleTy *stmt, tree fndecl,
+                                      const MemRef */*DestLoc*/,
+                                      Value *&Result,
+                                      Type *ResultType,
+                                      std::vector<Value *> &Ops) {
   // DECL_FUNCTION_CODE contains a value of the enumerated type ix86_builtins,
   // declared in i386.c.  If this type was visible to us then we could simply
   // use a switch statement on DECL_FUNCTION_CODE to jump to the right code for
@@ -161,6 +191,12 @@ bool TreeToLLVM::TargetIntrinsicLower(
   bool flip = false;
   unsigned PredCode;
 
+  LLVMContext &Context =
+#if LLVM_VERSION_CODE > LLVM_VERSION(3, 8)
+      ResultType->getContext();
+#else
+      TheContext;
+#endif
   switch (Handler) {
   case SearchForHandler:
     debug_gimple_stmt(stmt);
@@ -186,7 +222,13 @@ bool TreeToLLVM::TargetIntrinsicLower(
     unsigned EltBitWidth = EltTy->getPrimitiveSizeInBits();
     Type *IntEltTy = IntegerType::get(Context, EltBitWidth);
     Type *IntVecTy = VectorType::get(IntEltTy, VecTy->getNumElements());
-    APInt SignBit = APInt::getSignBit(EltBitWidth);
+    APInt SignBit =
+#if LLVM_VERSION_CODE > LLVM_VERSION(4, 0)
+        APInt::getSignMask
+#else
+        APInt::getSignBit
+#endif
+        (EltBitWidth);
     Constant *SignMask = ConstantInt::get(IntVecTy, SignBit);
     Value *IntLHS = Builder.CreateBitCast(Ops[0], IntVecTy);
     Value *IntRHS = Builder.CreateBitCast(Ops[1], IntVecTy);
@@ -878,11 +920,23 @@ bool TreeToLLVM::TargetIntrinsicLower(
         Ops[1] = ConstantInt::get(IntTy, (shiftVal - 16) * 8);
 
         // create i32 constant
+        // https://reviews.llvm.org/rL229069
+#if LLVM_VERSION_CODE > LLVM_VERSION(3, 8)
+        Ops[1] = Ops[0];
+        Ops[0] = Constant::getNullValue(VecTy);
+        SmallVector<Constant *, 16> Indices;
+        for (unsigned i = 0; i != 16; ++i)
+          Indices.push_back(ConstantInt::get(IntTy, (shiftVal - 16) + i));
+        Value *SV = ConstantVector::get(Indices);
+        Result = Builder.CreateShuffleVector(Ops[1], Ops[0], SV, "palignr");
+        Result = Builder.CreateBitCast(Result, ResultType, "cast");
+#else
         Function *F =
             Intrinsic::getDeclaration(TheModule, Intrinsic::x86_sse2_psrl_dq);
         Result =
             Builder.CreateCall(F, ArrayRef<Value *>(&Ops[0], 2), "palignr");
         Result = Builder.CreateBitCast(Result, ResultType);
+#endif
         return true;
       }
 
@@ -905,7 +959,11 @@ bool TreeToLLVM::TargetIntrinsicLower(
   case movntq:
   case movntsd:
   case movntss: {
-    MDNode *Node = MDNode::get(Context, Builder.getInt32(1));
+    MDNode *Node = MDNode::get(Context,
+#if LLVM_VERSION_CODE > LLVM_VERSION(3, 8)
+            ConstantAsMetadata::get
+#endif
+            (Builder.getInt32(1)));
 
     // Convert the type of the pointer to a pointer to the stored type.
     unsigned AS = Ops[0]->getType()->getPointerAddressSpace();
@@ -1034,7 +1092,12 @@ bool TreeToLLVM::TargetIntrinsicLower(
     Result = Builder.CreateTruncOrBitCast(Ops[0], Int16Ty);
     Function *ctlz =
         Intrinsic::getDeclaration(TheModule, Intrinsic::ctlz, Int16Ty);
-    Result = Builder.CreateCall2(ctlz, Result, Builder.getTrue());
+    Result =
+#if LLVM_VERSION_CODE > LLVM_VERSION(3, 8)
+        Builder.CreateCall(ctlz, {Result, Builder.getTrue()});
+#else
+        Builder.CreateCall2(ctlz, Result, Builder.getTrue());
+#endif
     return true;
   }
   case ctzs: {
@@ -1043,7 +1106,12 @@ bool TreeToLLVM::TargetIntrinsicLower(
     Result = Builder.CreateTruncOrBitCast(Ops[0], Int16Ty);
     Function *cttz =
         Intrinsic::getDeclaration(TheModule, Intrinsic::cttz, Int16Ty);
-    Result = Builder.CreateCall2(cttz, Result, Builder.getTrue());
+    Result =
+#if LLVM_VERSION_CODE > LLVM_VERSION(3, 8)
+        Builder.CreateCall(cttz, {Result, Builder.getTrue()});
+#else
+        Builder.CreateCall2(cttz, Result, Builder.getTrue());
+#endif
     return true;
   }
   case rdrand16_step:
@@ -1076,10 +1144,25 @@ static bool llvm_x86_64_should_pass_aggregate_in_memory(
     tree TreeType, enum machine_mode Mode) {
   int IntRegs, SSERegs;
   /* If examine_argument return 0, then it's passed byval in memory.*/
-  int ret = examine_argument(Mode, TreeType, 0, &IntRegs, &SSERegs);
+#if (GCC_MAJOR > 4)
+  bool ret =
+#else
+  int ret =
+#endif
+      examine_argument(Mode, TreeType, 0, &IntRegs, &SSERegs);
+#if (GCC_MAJOR > 4)
+  if (ret)
+#else
   if (ret == 0)
+#endif
     return true;
-  if (ret == 1 && IntRegs == 0 && SSERegs == 0) // zero-sized struct
+  if (
+#if (GCC_MAJOR > 4)
+      !ret
+#else
+      ret == 1
+#endif
+      && IntRegs == 0 && SSERegs == 0) // zero-sized struct
     return true;
   return false;
 }
@@ -1116,6 +1199,12 @@ bool llvm_x86_32_should_pass_aggregate_in_mixed_regs(
   if (!STy || STy->isPacked())
     return false;
 
+  LLVMContext &Context =
+#if LLVM_VERSION_CODE > LLVM_VERSION(3, 8)
+      STy->getContext();
+#else
+      TheContext;
+#endif
   for (unsigned i = 0, e = STy->getNumElements(); i != e; ++i) {
     Type *EltTy = STy->getElementType(i);
     // 32 and 64-bit integers are fine, as are float and double.  Long double
@@ -1152,6 +1241,12 @@ bool llvm_x86_should_pass_aggregate_as_fca(tree type, Type *Ty) {
   // makes it ABI compatible for x86-64. Same for _Complex char and _Complex
   // short in 32-bit.
   Type *EltTy = STy->getElementType(0);
+  LLVMContext &Context =
+#if LLVM_VERSION_CODE > LLVM_VERSION(3, 8)
+      EltTy->getContext();
+#else
+      TheContext;
+#endif
   return !((TARGET_64BIT &&
             (EltTy->isIntegerTy() || EltTy == Type::getFloatTy(Context) ||
              EltTy == Type::getDoubleTy(Context))) || EltTy->isIntegerTy(16) ||
@@ -1185,6 +1280,12 @@ static void count_num_registers_uses(std::vector<Type *> &ScalarElts,
                                      unsigned &NumGPRs, unsigned &NumXMMs) {
   for (size_t i = 0, e = ScalarElts.size(); i != e; ++i) {
     Type *Ty = ScalarElts[i];
+    LLVMContext &Context =
+#if LLVM_VERSION_CODE > LLVM_VERSION(3, 8)
+        Ty->getContext();
+#else
+        TheContext;
+#endif
     if (VectorType *VTy = llvm::dyn_cast<VectorType>(Ty)) {
       if (!TARGET_MACHO)
         continue;
@@ -1278,6 +1379,12 @@ bool llvm_x86_64_should_pass_aggregate_in_mixed_regs(
     // This will fit in one i32 register.
     return false;
 
+  LLVMContext &Context =
+#if LLVM_VERSION_CODE > LLVM_VERSION(3, 8)
+      Ty->getContext();
+#else
+      TheContext;
+#endif
   for (int i = 0; i < NumClasses; ++i) {
     switch (Class[i]) {
     case X86_64_INTEGER_CLASS:
@@ -1526,6 +1633,12 @@ Type *llvm_x86_scalar_type_for_struct_return(tree type, unsigned *Offset) {
   *Offset = 0;
   Type *Ty = ConvertType(type);
   uint64_t Size = getDataLayout().getTypeAllocSize(Ty);
+  LLVMContext &Context =
+#if LLVM_VERSION_CODE > LLVM_VERSION(3, 8)
+      Ty->getContext();
+#else
+      TheContext;
+#endif
   if (Size == 0)
     return Type::getVoidTy(Context);
   else if (Size == 1)
@@ -1627,6 +1740,12 @@ static void llvm_x86_64_get_multiple_return_reg_classes(
   if (NumClasses == 1 && Class[0] == X86_64_NO_CLASS)
     return;
 
+  LLVMContext &Context =
+#if LLVM_VERSION_CODE > LLVM_VERSION(3, 8)
+      TheModule->getContext();
+#else
+      TheContext;
+#endif
   for (int i = 0; i < NumClasses; ++i) {
     switch (Class[i]) {
     case X86_64_INTEGER_CLASS:
@@ -1738,6 +1857,12 @@ Type *llvm_x86_aggr_type_for_struct_return(tree type) {
 
   StructType *STy = cast<StructType>(Ty);
   std::vector<Type *> ElementTypes;
+  LLVMContext &Context =
+#if LLVM_VERSION_CODE > LLVM_VERSION(3, 8)
+      Ty->getContext();
+#else
+      TheContext;
+#endif
 
   // Special handling for _Complex.
   if (llvm_x86_should_not_return_complex_in_memory(type)) {
@@ -1765,6 +1890,12 @@ static void llvm_x86_extract_mrv_array_element(
   Value *EVI = Builder.CreateExtractValue(Src, SrcFieldNo, "mrv_gr");
   StructType *STy = cast<StructType>(Src->getType());
   Value *Idxs[3];
+  LLVMContext &Context =
+#if LLVM_VERSION_CODE > LLVM_VERSION(3, 8)
+      STy->getContext();
+#else
+      TheContext;
+#endif
   Idxs[0] = ConstantInt::get(Type::getInt32Ty(Context), 0);
   Idxs[1] = ConstantInt::get(Type::getInt32Ty(Context), DestFieldNo);
   Idxs[2] = ConstantInt::get(Type::getInt32Ty(Context), DestElemNo);
@@ -1793,6 +1924,13 @@ void llvm_x86_extract_multiple_return_value(
   unsigned SNO = 0;
   unsigned DNO = 0;
 
+  LLVMContext &Context =
+#if LLVM_VERSION_CODE > LLVM_VERSION(3, 8)
+      STy->getContext();
+#else
+      TheContext;
+#endif
+
   if (DestTy->getNumElements() == 3 &&
       DestTy->getElementType(0)->getTypeID() == Type::FloatTyID &&
       DestTy->getElementType(1)->getTypeID() == Type::FloatTyID &&
@@ -1804,15 +1942,27 @@ void llvm_x86_extract_multiple_return_value(
 
     Value *E0Index = ConstantInt::get(Type::getInt32Ty(Context), 0);
     Value *EVI0 = Builder.CreateExtractElement(EVI, E0Index, "mrv.v");
-    Value *GEP0 = Builder.CreateStructGEP(Dest, 0, "mrv_gep");
+    Value *GEP0 = Builder.CreateStructGEP(
+#if LLVM_VERSION_CODE > LLVM_VERSION(3, 8)
+            DestTy,
+#endif
+            Dest, 0, "mrv_gep");
     Builder.CreateAlignedStore(EVI0, GEP0, 1, isVolatile);
 
     Value *E1Index = ConstantInt::get(Type::getInt32Ty(Context), 1);
     Value *EVI1 = Builder.CreateExtractElement(EVI, E1Index, "mrv.v");
-    Value *GEP1 = Builder.CreateStructGEP(Dest, 1, "mrv_gep");
+    Value *GEP1 = Builder.CreateStructGEP(
+#if LLVM_VERSION_CODE > LLVM_VERSION(3, 8)
+            DestTy,
+#endif
+            Dest, 1, "mrv_gep");
     Builder.CreateAlignedStore(EVI1, GEP1, 1, isVolatile);
 
-    Value *GEP2 = Builder.CreateStructGEP(Dest, 2, "mrv_gep");
+    Value *GEP2 = Builder.CreateStructGEP(
+#if LLVM_VERSION_CODE > LLVM_VERSION(3, 8)
+            DestTy,
+#endif
+            Dest, 2, "mrv_gep");
     Value *EVI2 = Builder.CreateExtractValue(Src, 1, "mrv_gr");
     Builder.CreateAlignedStore(EVI2, GEP2, 1, isVolatile);
     return;
@@ -1824,7 +1974,11 @@ void llvm_x86_extract_multiple_return_value(
 
     // Directly access first class values using getresult.
     if (DestElemType->isSingleValueType()) {
-      Value *GEP = Builder.CreateStructGEP(Dest, DNO, "mrv_gep");
+      Value *GEP = Builder.CreateStructGEP(
+#if LLVM_VERSION_CODE > LLVM_VERSION(3, 8)
+              DestTy,
+#endif
+              Dest, DNO, "mrv_gep");
       Value *EVI = Builder.CreateExtractValue(Src, SNO, "mrv_gr");
       Builder.CreateAlignedStore(EVI, GEP, 1, isVolatile);
       ++DNO;

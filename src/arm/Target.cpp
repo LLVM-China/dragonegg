@@ -46,6 +46,11 @@ extern "C" {
 #include "tree.h"
 
 #include "diagnostic.h"
+#if (GCC_MAJOR > 4)
+#include "function.h"
+#include "basic-block.h"
+#include "stor-layout.h"
+#endif
 #include "gimple.h"
 #include "toplev.h"
 #ifndef ENABLE_BUILD_WITH_CXX
@@ -55,7 +60,11 @@ extern "C" {
 // Trees header.
 #include "dragonegg/Trees.h"
 
-static LLVMContext &Context = getGlobalContext();
+using namespace llvm;
+
+#if LLVM_VERSION_CODE < LLVM_VERSION(3, 9)
+static LLVMContext &TheContext = getGlobalContext();
+#endif
 
 // "Fundamental Data Types" according to the AAPCS spec.  These are used
 // to check that a given aggregate meets the criteria for a "homogeneous
@@ -258,10 +267,16 @@ static bool vfp_arg_homogeneous_aggregate_p(enum machine_mode mode, tree type,
 // push the proper LLVM Types that represent the register types to pass
 // that struct member in.
 static void push_elts(Type *Ty, std::vector<Type *> &Elts) {
+  LLVMContext &Context =
+#if LLVM_VERSION_CODE > LLVM_VERSION(3, 8)
+      Ty->getContext();
+#else
+      TheContext;
+#endif
   for (Type::subtype_iterator I = Ty->subtype_begin(), E = Ty->subtype_end();
        I != E; ++I) {
     Type *STy = *I;
-    if (const VectorType *VTy = dyn_cast<VectorType>(STy)) {
+    if (const VectorType *VTy = llvm::dyn_cast<VectorType>(STy)) {
       switch (VTy->getBitWidth()) {
       case 64: // v2f32
         Elts.push_back(VectorType::get(Type::getFloatTy(Context), 2));
@@ -272,7 +287,7 @@ static void push_elts(Type *Ty, std::vector<Type *> &Elts) {
       default:
         assert(0 && "invalid vector type");
       }
-    } else if (ArrayType *ATy = dyn_cast<ArrayType>(STy)) {
+    } else if (ArrayType *ATy = llvm::dyn_cast<ArrayType>(STy)) {
       Type *ETy = ATy->getElementType();
 
       for (uint64_t i = ATy->getNumElements(); i > 0; --i)
@@ -329,23 +344,29 @@ extern bool llvm_arm_try_pass_aggregate_custom(
   // First, build a type that will be bitcast to the original one and
   // from where elements will be extracted.
   std::vector<Type *> Elts;
-  Type *Int32Ty = Type::getInt32Ty(getGlobalContext());
+  LLVMContext &Context =
+#if LLVM_VERSION_CODE > LLVM_VERSION(3, 8)
+      Ty->getContext();
+#else
+      TheContext;
+#endif
+  Type *Int32Ty = Type::getInt32Ty(Context);
   const unsigned NumRegularArgs = Size / 4;
   for (unsigned i = 0; i < NumRegularArgs; ++i) {
     Elts.push_back(Int32Ty);
   }
   const unsigned RestSize = Size % 4;
-  llvm::Type *RestType = NULL;
+  Type *RestType = NULL;
   if (RestSize > 2) {
-    RestType = Type::getInt32Ty(getGlobalContext());
+    RestType = Type::getInt32Ty(Context);
   } else if (RestSize > 1) {
-    RestType = Type::getInt16Ty(getGlobalContext());
+    RestType = Type::getInt16Ty(Context);
   } else if (RestSize > 0) {
-    RestType = Type::getInt8Ty(getGlobalContext());
+    RestType = Type::getInt8Ty(Context);
   }
   if (RestType)
     Elts.push_back(RestType);
-  StructType *STy = StructType::get(getGlobalContext(), Elts, false);
+  StructType *STy = StructType::get(Context, Elts, false);
 
   if (AddPad) {
     ScalarElts.push_back(Int32Ty);
@@ -373,7 +394,8 @@ extern bool llvm_arm_try_pass_aggregate_custom(
 // for parameter passing. This only applies to AAPCS-VFP "homogeneous
 // aggregates" as specified in 4.3.5 of the AAPCS spec.
 bool llvm_arm_should_pass_aggregate_in_mixed_regs(
-    tree TreeType, Type *Ty, CallingConv::ID CC, std::vector<Type *> &Elts) {
+    tree TreeType, Type *Ty, CallingConv::ID CC,
+    std::vector<Type *> &Elts) {
   if (!llvm_arm_should_pass_or_return_aggregate_in_regs(TreeType, CC))
     return false;
 
@@ -418,7 +440,13 @@ static bool count_num_registers_uses(std::vector<Type *> &ScalarElts,
                                      bool *SPRs) {
   for (unsigned i = 0, e = ScalarElts.size(); i != e; ++i) {
     Type *Ty = ScalarElts[i];
-    if (const VectorType *VTy = dyn_cast<VectorType>(Ty)) {
+    LLVMContext &Context =
+#if LLVM_VERSION_CODE > LLVM_VERSION(3, 8)
+        Ty->getContext();
+#else
+        TheContext;
+#endif
+    if (const VectorType *VTy = llvm::dyn_cast<VectorType>(Ty)) {
       switch (VTy->getBitWidth()) {
       case 64:
         if (!alloc_next_dpr(SPRs))
@@ -490,7 +518,12 @@ Type *llvm_arm_aggr_type_for_struct_return(tree TreeType, CallingConv::ID CC) {
   std::vector<Type *> Elts;
   Type *Ty = ConvertType(TreeType);
   push_elts(Ty, Elts);
-
+  LLVMContext &Context =
+#if LLVM_VERSION_CODE > LLVM_VERSION(3, 8)
+      Ty->getContext();
+#else
+      TheContext;
+#endif
   return StructType::get(Context, Elts, false);
 }
 
@@ -507,10 +540,16 @@ static void llvm_arm_extract_mrv_array_element(
     bool isVolatile) {
   Value *EVI = Builder.CreateExtractValue(Src, SrcFieldNo, "mrv_gr");
   const StructType *STy = cast<StructType>(Src->getType());
-  llvm::Value *Idxs[3];
-  Idxs[0] = ConstantInt::get(llvm::Type::getInt32Ty(Context), 0);
-  Idxs[1] = ConstantInt::get(llvm::Type::getInt32Ty(Context), DestFieldNo);
-  Idxs[2] = ConstantInt::get(llvm::Type::getInt32Ty(Context), DestElemNo);
+  Value *Idxs[3];
+  LLVMContext &Context =
+#if LLVM_VERSION_CODE > LLVM_VERSION(3, 8)
+      EVI->getContext();
+#else
+      TheContext;
+#endif
+  Idxs[0] = ConstantInt::get(Type::getInt32Ty(Context), 0);
+  Idxs[1] = ConstantInt::get(Type::getInt32Ty(Context), DestFieldNo);
+  Idxs[2] = ConstantInt::get(Type::getInt32Ty(Context), DestElemNo);
   Value *GEP = Builder.CreateGEP(Dest, Idxs, "mrv_gep");
   if (STy->getElementType(SrcFieldNo)->isVectorTy()) {
     Value *ElemIndex = ConstantInt::get(Type::getInt32Ty(Context), SrcElemNo);
@@ -530,7 +569,7 @@ void llvm_arm_extract_multiple_return_value(
   unsigned NumElements = STy->getNumElements();
 
   const PointerType *PTy = cast<PointerType>(Dest->getType());
-  const StructType *DestTy = cast<StructType>(PTy->getElementType());
+  StructType *DestTy = cast<StructType>(PTy->getElementType());
 
   unsigned SNO = 0;
   unsigned DNO = 0;
@@ -541,7 +580,11 @@ void llvm_arm_extract_multiple_return_value(
 
     // Directly access first class values.
     if (DestElemType->isSingleValueType()) {
-      Value *GEP = Builder.CreateStructGEP(Dest, DNO, "mrv_gep");
+      Value *GEP = Builder.CreateStructGEP(
+#if LLVM_VERSION_CODE > LLVM_VERSION(3, 8)
+                                           DestTy,
+#endif
+                                           Dest, DNO, "mrv_gep");
       Value *EVI = Builder.CreateExtractValue(Src, SNO, "mrv_gr");
       Builder.CreateAlignedStore(EVI, GEP, 1, isVolatile);
       ++DNO;
@@ -559,7 +602,7 @@ void llvm_arm_extract_multiple_return_value(
       unsigned Size = 1;
 
       if (const VectorType *SElemTy =
-              dyn_cast<VectorType>(STy->getElementType(SNO))) {
+              llvm::dyn_cast<VectorType>(STy->getElementType(SNO))) {
         Size = SElemTy->getNumElements();
       }
       while (i < Size) {

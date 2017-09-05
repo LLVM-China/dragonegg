@@ -25,6 +25,10 @@
 
 // LLVM headers
 #include "llvm/IR/Module.h"
+#if LLVM_VERSION_CODE > LLVM_VERSION(3, 8)
+#include "llvm/Transforms/Utils/Local.h"
+#include "llvm/IR/IntrinsicInst.h"
+#endif
 
 // System headers
 #include <gmp.h>
@@ -198,7 +202,11 @@ static StringRef getLinkageName(tree Node) {
   tree decl_name = DECL_NAME(Node);
   if (decl_name != NULL && IDENTIFIER_POINTER(decl_name) != NULL) {
     if (TREE_PUBLIC(Node) && DECL_ASSEMBLER_NAME(Node) != DECL_NAME(Node) &&
+#if (GCC_MAJOR > 4)
+        !DECL_ABSTRACT_P(Node)) {
+#else
         !DECL_ABSTRACT(Node)) {
+#endif
       return StringRef(IDENTIFIER_POINTER(DECL_ASSEMBLER_NAME(Node)));
     }
   }
@@ -231,19 +239,28 @@ StringRef DebugInfo::getFunctionName(tree FnDecl) {
 
 /// EmitFunctionStart - Constructs the debug code for entering a function.
 void DebugInfo::EmitFunctionStart(tree FnDecl, Function *Fn) {
-  DIType FNType = getOrCreateType(TREE_TYPE(FnDecl));
+  MigDIType FNType = getOrCreateType(TREE_TYPE(FnDecl));
 
   unsigned lineno = CurLineNo;
 
-  std::map<tree_node *, WeakVH>::iterator I = SPCache.find(FnDecl);
+  std::map<tree_node *, MigTrackingMDRefType>::iterator I = SPCache.find(FnDecl);
   if (I != SPCache.end()) {
+#if LLVM_VERSION_CODE > LLVM_VERSION(3, 8)
+    DISubprogram *SPDecl = llvm::getDISubprogram(cast<MDNode>(I->second));
+#else
     DISubprogram SPDecl(cast<MDNode>(I->second));
-    DISubprogram SP = CreateSubprogramDefinition(SPDecl, lineno, Fn);
+#endif
+    MigDISubprogram SP = CreateSubprogramDefinition(SPDecl, lineno, Fn);
     SPDecl->replaceAllUsesWith(SP);
 
     // Push function on region stack.
+#if LLVM_VERSION_CODE > LLVM_VERSION(3, 8)
+    RegionStack.push_back(SP);
+    RegionMap[FnDecl].reset(SP);
+#else
     RegionStack.push_back(WeakVH(SP));
     RegionMap[FnDecl] = WeakVH(SP);
+#endif
     return;
   }
 
@@ -254,21 +271,35 @@ void DebugInfo::EmitFunctionStart(tree FnDecl, Function *Fn) {
       DECL_ABSTRACT_ORIGIN(FnDecl) != FnDecl)
     ArtificialFnWithAbstractOrigin = true;
 
-  DIDescriptor SPContext =
-      ArtificialFnWithAbstractOrigin ? getOrCreateFile(main_input_filename)
-                                     : findRegion(DECL_CONTEXT(FnDecl));
+  MigDIScope SPContext =
+      ArtificialFnWithAbstractOrigin ?
+#if LLVM_VERSION_CODE > LLVM_VERSION(3, 8)
+      dyn_cast_or_null<DIScope>(getOrCreateFile(main_input_filename))
+#else
+      getOrCreateFile(main_input_filename)
+#endif
+      : findRegion(DECL_CONTEXT(FnDecl));
 
   // Creating context may have triggered creation of this SP descriptor. So
   // check the cache again.
   I = SPCache.find(FnDecl);
   if (I != SPCache.end()) {
+#if LLVM_VERSION_CODE > LLVM_VERSION(3, 8)
+    DISubprogram *SPDecl = llvm::getDISubprogram(cast<MDNode>(I->second));
+#else
     DISubprogram SPDecl(cast<MDNode>(I->second));
-    DISubprogram SP = CreateSubprogramDefinition(SPDecl, lineno, Fn);
+#endif
+    MigDISubprogram SP = CreateSubprogramDefinition(SPDecl, lineno, Fn);
     SPDecl->replaceAllUsesWith(SP);
 
     // Push function on region stack.
+#if LLVM_VERSION_CODE > LLVM_VERSION(3, 8)
+    RegionStack.push_back(SP);
+    RegionMap[FnDecl].reset(SP);
+#else
     RegionStack.push_back(WeakVH(SP));
     RegionMap[FnDecl] = WeakVH(SP);
+#endif
     return;
   }
 
@@ -278,67 +309,115 @@ void DebugInfo::EmitFunctionStart(tree FnDecl, Function *Fn) {
 
   unsigned Virtuality = 0;
   unsigned VIndex = 0;
-  DIType ContainingType;
+  MigDIType ContainingType;
   if (DECL_VINDEX(FnDecl) && DECL_CONTEXT(FnDecl) &&
       isa<TYPE>((DECL_CONTEXT(FnDecl)))) { // Workaround GCC PR42653
+#if (GCC_MAJOR > 4)
+    if (tree_fits_uhwi_p(DECL_VINDEX(FnDecl)))
+      VIndex = tree_to_shwi(DECL_VINDEX(FnDecl));
+#else
     if (host_integerp(DECL_VINDEX(FnDecl), 0))
       VIndex = tree_low_cst(DECL_VINDEX(FnDecl), 0);
+#endif
     Virtuality = dwarf::DW_VIRTUALITY_virtual;
     ContainingType = getOrCreateType(DECL_CONTEXT(FnDecl));
   }
 
   StringRef FnName = getFunctionName(FnDecl);
 
-  DISubprogram SP = CreateSubprogram(
-      SPContext, FnName, FnName, LinkageName, getOrCreateFile(Loc.file), lineno,
-      FNType, Fn->hasInternalLinkage(), true /*definition*/, Virtuality, VIndex,
-      ContainingType, DECL_ARTIFICIAL(FnDecl), optimize, Fn);
+  MigDISubprogram SP = CreateSubprogram(
+          SPContext, FnName, FnName, LinkageName, getOrCreateFile(Loc.file),
+          lineno, FNType, Fn->hasInternalLinkage(), true /*definition*/,
+          ContainingType, Virtuality, VIndex, DECL_ARTIFICIAL(FnDecl),
+          optimize, Fn);
 
-  SPCache[FnDecl] = WeakVH(SP);
+#if LLVM_VERSION_CODE > LLVM_VERSION(3, 8)
+  SPCache[FnDecl].reset(SP);
 
   // Push function on region stack.
+  RegionStack.push_back(SP);
+  RegionMap[FnDecl].reset(SP);
+#else
+  SPCache[FnDecl] = WeakVH(SP);
   RegionStack.push_back(WeakVH(SP));
   RegionMap[FnDecl] = WeakVH(SP);
+#endif
 }
 
 /// getOrCreateNameSpace - Get name space descriptor for the tree node.
-DINameSpace DebugInfo::getOrCreateNameSpace(tree Node, DIDescriptor Context) {
-  std::map<tree_node *, WeakVH>::iterator I = NameSpaceCache.find(Node);
+MigDINamespace DebugInfo::getOrCreateNameSpace(tree Node, MigDIScope Context) {
+  std::map<tree_node *, MigTrackingMDRefType>::iterator I = NameSpaceCache.find(Node);
   if (I != NameSpaceCache.end())
+#if LLVM_VERSION_CODE > LLVM_VERSION(3, 8)
+    return dyn_cast_or_null<DINamespace>(cast<MDNode>(I->second));
+#else
     return DINameSpace(cast<MDNode>(I->second));
+#endif
 
   expanded_location Loc = GetNodeLocation(Node, false);
-  DINameSpace DNS = Builder.createNameSpace(
-      Context, GetNodeName(Node), getOrCreateFile(Loc.file), Loc.line);
+  MigDINamespace DNS = Builder.createNameSpace(
+      Context, GetNodeName(Node)
+#if LLVM_VERSION_CODE < LLVM_VERSION(5, 0)
+      , getOrCreateFile(Loc.file),
+      Loc.line
+#endif
+#if LLVM_VERSION_CODE > LLVM_VERSION(3, 9)
+      , true
+#endif
+      );
 
+#if LLVM_VERSION_CODE > LLVM_VERSION(3, 8)
+  NameSpaceCache[Node].reset(DNS);
+#else
   NameSpaceCache[Node] = WeakVH(DNS);
+#endif
   return DNS;
 }
 
 /// findRegion - Find tree_node N's region.
-DIDescriptor DebugInfo::findRegion(tree Node) {
+MigDIScope DebugInfo::findRegion(tree Node) {
   if (Node == NULL_TREE)
+#if LLVM_VERSION_CODE > LLVM_VERSION(3, 8)
+    return dyn_cast_or_null<DIScope>(getOrCreateFile(main_input_filename));
+#else
     return getOrCreateFile(main_input_filename);
+#endif
 
-  std::map<tree_node *, WeakVH>::iterator I = RegionMap.find(Node);
+  std::map<tree_node *, MigTrackingMDRefType>::iterator I = RegionMap.find(Node);
   if (I != RegionMap.end())
-    if (MDNode *R = dyn_cast_or_null<MDNode>(&*I->second))
+    if (MDNode *R = cast<MDNode>(&*I->second))
+#if LLVM_VERSION_CODE > LLVM_VERSION(3, 8)
+      return dyn_cast_or_null<DIScope>(R);
+#else
       return DIDescriptor(R);
+#endif
 
   if (isa<TYPE>(Node)) {
-    DIType Ty = getOrCreateType(Node);
+    MigDIType Ty = getOrCreateType(Node);
+#if LLVM_VERSION_CODE > LLVM_VERSION(3, 8)
+    return dyn_cast_or_null<DIScope>(Ty);
+#else
     return DIDescriptor(Ty);
+#endif
   } else if (DECL_P(Node)) {
     if (isa<NAMESPACE_DECL>(Node)) {
-      DIDescriptor NSContext = findRegion(DECL_CONTEXT(Node));
-      DINameSpace NS = getOrCreateNameSpace(Node, NSContext);
+      MigDIScope NSContext = findRegion(DECL_CONTEXT(Node));
+      MigDINamespace NS = getOrCreateNameSpace(Node, NSContext);
+#if LLVM_VERSION_CODE > LLVM_VERSION(3, 8)
+      return dyn_cast_or_null<DIScope>(NS);
+#else
       return DIDescriptor(NS);
+#endif
     }
     return findRegion(DECL_CONTEXT(Node));
   }
 
   // Otherwise main compile unit covers everything.
+#if LLVM_VERSION_CODE > LLVM_VERSION(3, 8)
+  return dyn_cast_or_null<DIScope>(getOrCreateFile(main_input_filename));
+#else
   return getOrCreateFile(main_input_filename);
+#endif
 }
 
 /// EmitFunctionEnd - Pop the region stack and reset current lexical block.
@@ -367,17 +446,35 @@ void DebugInfo::EmitDeclare(tree decl, unsigned Tag, StringRef Name, tree type,
   expanded_location Loc = GetNodeLocation(decl, false);
 
   // Construct variable.
+#if LLVM_VERSION_CODE > LLVM_VERSION(3, 8)
+  DIScope *VarScope = dyn_cast_or_null<DIScope>(cast<MDNode>(RegionStack.back()));
+#else
   DIScope VarScope = DIScope(cast<MDNode>(RegionStack.back()));
-  DIType Ty = getOrCreateType(type);
+#endif
+  MigDIType Ty = getOrCreateType(type);
   if (Ty && DECL_ARTIFICIAL(decl))
     Ty = Builder.createArtificialType(Ty);
   // If type info is not available then do not emit debug info for this var.
   if (!Ty)
     return;
+
+  // https://reviews.llvm.org/rL243764
+#if LLVM_VERSION_CODE > LLVM_VERSION(3, 8)
+  llvm::DILocalVariable *D = Builder.createAutoVariable(
+      VarScope, Name, getOrCreateFile(Loc.file), Loc.line, Ty, optimize);
+  DbgDeclareInst *DbgDecl = FindAllocaDbgDeclare(AI);
+#else
   llvm::DIVariable D = Builder.createLocalVariable(
       Tag, VarScope, Name, getOrCreateFile(Loc.file), Loc.line, Ty, optimize);
+#endif
 
-  Instruction *Call = Builder.insertDeclare(AI, D, Builder.createExpression(),
+  Instruction *Call = Builder.insertDeclare(AI, D,
+#if LLVM_VERSION_CODE > LLVM_VERSION(3, 3)
+                                            Builder.createExpression(),
+#endif
+#if LLVM_VERSION_CODE > LLVM_VERSION(3, 8)
+                                            DbgDecl->getDebugLoc(),
+#endif
                                             IRBuilder.GetInsertBlock());
 
   Call->setDebugLoc(DebugLoc::get(Loc.line, 0, VarScope));
@@ -410,7 +507,7 @@ void DebugInfo::EmitGlobalVariable(GlobalVariable *GV, tree decl) {
     return;
   // Gather location information.
   expanded_location Loc = expand_location(DECL_SOURCE_LOCATION(decl));
-  DIType TyD = getOrCreateType(TREE_TYPE(decl));
+  MigDIType TyD = getOrCreateType(TREE_TYPE(decl));
   StringRef DispName = GV->getName();
   if (DispName.empty())
     DispName = "__unknown__";
@@ -423,13 +520,25 @@ void DebugInfo::EmitGlobalVariable(GlobalVariable *GV, tree decl) {
   if (DECL_CONTEXT(decl))
     if (!isa<FUNCTION_DECL>(DECL_CONTEXT(decl)))
       LinkageName = GV->getName();
+#if LLVM_VERSION_CODE > LLVM_VERSION(3, 9)
+  Builder.createGlobalVariableExpression(
+#elif LLVM_VERSION_CODE > LLVM_VERSION(3, 3)
   Builder.createGlobalVariable(
+#else
+  Builder.createStaticVariable(
+#endif
       findRegion(DECL_CONTEXT(decl)), DispName, LinkageName,
-      getOrCreateFile(Loc.file), Loc.line, TyD, GV->hasInternalLinkage(), GV);
+      getOrCreateFile(Loc.file), Loc.line, TyD, GV->hasInternalLinkage(),
+#if LLVM_VERSION_CODE > LLVM_VERSION(3, 9)
+      nullptr
+#else
+      GV
+#endif
+  );
 }
 
 /// createBasicType - Create BasicType.
-DIType DebugInfo::createBasicType(tree type) {
+MigDIType DebugInfo::createBasicType(tree type) {
 
   StringRef TypeName = GetNodeName(type);
   if (TypeName.empty())
@@ -465,7 +574,11 @@ DIType DebugInfo::createBasicType(tree type) {
     llvm_unreachable("Basic type case missing");
   }
 
-  return Builder.createBasicType(TypeName, Size, Align, Encoding);
+  return Builder.createBasicType(TypeName, Size,
+#if LLVM_VERSION_CODE < LLVM_VERSION(4, 0)
+                                 Align,
+#endif
+                                 Encoding);
 }
 
 /// isArtificialArgumentType - Return true if arg_type represents artificial,
@@ -484,22 +597,47 @@ static bool isArtificialArgumentType(tree arg_type, tree method_type) {
 }
 
 /// createMethodType - Create MethodType.
-DIType DebugInfo::createMethodType(tree type) {
+MigDIType DebugInfo::createMethodType(tree type) {
 
   // Create a  place holder type first. The may be used as a context
   // for the argument types.
-  llvm::DIType FwdType = Builder.createReplaceableForwardDecl(
+  // https://reviews.llvm.org/rL228852
+#if LLVM_VERSION_CODE > LLVM_VERSION(3, 8)
+  DICompositeType *FwdType = Builder.createReplaceableCompositeType(
+#else
+  DIType FwdType =
+#if LLVM_VERSION_CODE > LLVM_VERSION(3, 3)
+     Builder.createReplaceableForwardDecl(
+#else
+     Builder.createForwardDecl(
+#endif
+#endif
     llvm::dwarf::DW_TAG_subroutine_type, StringRef(),
     findRegion(TYPE_CONTEXT(type)), getOrCreateFile(main_input_filename),
     0, 0, 0, 0);
   llvm::MDNode *FTN = FwdType;
+#if LLVM_VERSION_CODE > LLVM_VERSION(3, 8)
+  llvm::TempMDNode FwdTypeNode(FTN);
+#else
   llvm::TrackingVH<llvm::MDNode> FwdTypeNode = FTN;
+#endif
+#if LLVM_VERSION_CODE > LLVM_VERSION(3, 8)
+  TypeCache[type].reset(FwdType);
+  RegionStack.push_back(FwdType);
+  RegionMap[type].reset(FwdType);
+#else
   TypeCache[type] = WeakVH(FwdType);
   // Push the struct on region stack.
   RegionStack.push_back(WeakVH(FwdType));
   RegionMap[type] = WeakVH(FwdType);
+#endif
 
-  llvm::SmallVector<Value*, 16> EltTys;
+#if LLVM_VERSION_CODE > LLVM_VERSION(3, 8)
+  llvm::SmallVector<Metadata*, 16>
+#else
+  llvm::SmallVector<Value*, 16>
+#endif
+      EltTys;
 
   // Add the result type at least.
   EltTys.push_back(getOrCreateType(TREE_TYPE(type)));
@@ -510,9 +648,9 @@ DIType DebugInfo::createMethodType(tree type) {
     tree formal_type = TREE_VALUE(arg);
     if (formal_type == void_type_node)
       break;
-    llvm::DIType FormalType = getOrCreateType(formal_type);
+    MigDIType FormalType = getOrCreateType(formal_type);
     if (!ProcessedFirstArg && isArtificialArgumentType(formal_type, type)) {
-      DIType AFormalType = Builder.createArtificialType(FormalType);
+      MigDIType AFormalType = Builder.createArtificialType(FormalType);
       EltTys.push_back(AFormalType);
     } else
       EltTys.push_back(FormalType);
@@ -520,28 +658,43 @@ DIType DebugInfo::createMethodType(tree type) {
       ProcessedFirstArg = true;
   }
 
+#if LLVM_VERSION_CODE > LLVM_VERSION(3, 8)
+  llvm::DITypeRefArray EltTypeArray = Builder.getOrCreateTypeArray(makeArrayRef(EltTys));
+#elif LLVM_VERSION_CODE > LLVM_VERSION(3, 3)
   llvm::DITypeArray EltTypeArray = Builder.getOrCreateTypeArray(EltTys);
+#else
+  llvm::DIArray EltTypeArray = Builder.getOrCreateArray(EltTys);
+#endif
 
   RegionStack.pop_back();
-  std::map<tree_node *, WeakVH>::iterator RI = RegionMap.find(type);
+  std::map<tree_node *, MigTrackingMDRefType>::iterator RI = RegionMap.find(type);
   if (RI != RegionMap.end())
     RegionMap.erase(RI);
 
-  llvm::DIType RealType = Builder.createSubroutineType(
-      getOrCreateFile(main_input_filename),
-      EltTypeArray);
+  MigDIType RealType =
+#if LLVM_VERSION_CODE > LLVM_VERSION(3, 8)
+      Builder.createSubroutineType(EltTypeArray);
+#else
+      Builder.createSubroutineType(
+           getOrCreateFile(main_input_filename),
+           EltTypeArray);
+#endif
 
   // Now that we have a real decl for the struct, replace anything using the
   // old decl with the new one.  This will recursively update the debug info.
+#if LLVM_VERSION_CODE > LLVM_VERSION(3, 8)
+  FwdTypeNode->replaceAllUsesWith(RealType);
+#else
   llvm::DIType(FwdTypeNode).replaceAllUsesWith(RealType);
+#endif
 
   return RealType;
 }
 
 /// createPointerType - Create PointerType.
-DIType DebugInfo::createPointerType(tree type) {
+MigDIType DebugInfo::createPointerType(tree type) {
 
-  DIType FromTy = getOrCreateType(TREE_TYPE(type));
+  MigDIType FromTy = getOrCreateType(TREE_TYPE(type));
   // type* and type&
   // FIXME: Should BLOCK_POINTER_TYP have its own DW_TAG?
   unsigned Tag =
@@ -552,16 +705,25 @@ DIType DebugInfo::createPointerType(tree type) {
   if (tree TyName = TYPE_NAME(type))
     if (isa<TYPE_DECL>(TyName) && !DECL_ORIGINAL_TYPE(TyName)) {
       expanded_location TypeNameLoc = GetNodeLocation(TyName);
-      DIType Ty = CreateDerivedType(
+      MigDIType Ty = CreateDerivedType(
           Tag, findRegion(DECL_CONTEXT(TyName)), GetNodeName(TyName),
           getOrCreateFile(TypeNameLoc.file), TypeNameLoc.line, 0 /*size*/,
           0 /*align*/, 0 /*offset */, 0 /*flags*/, FromTy);
+#if LLVM_VERSION_CODE > LLVM_VERSION(3, 8)
+      TypeCache[TyName].reset(Ty);
+#else
       TypeCache[TyName] = WeakVH(Ty);
+#endif
       return Ty;
     }
 
-  StringRef PName = FromTy.getName();
-  DIType PTy = CreateDerivedType(
+  StringRef PName =
+#if LLVM_VERSION_CODE > LLVM_VERSION(3, 8)
+      FromTy->getName();
+#else
+      FromTy.getName();
+#endif
+  MigDIType PTy = CreateDerivedType(
       Tag, findRegion(TYPE_CONTEXT(type)),
       Tag == DW_TAG_pointer_type ? StringRef() : PName,
       getOrCreateFile(main_input_filename), 0 /*line no*/, NodeSizeInBits(type),
@@ -570,11 +732,16 @@ DIType DebugInfo::createPointerType(tree type) {
 }
 
 /// createArrayType - Create ArrayType.
-DIType DebugInfo::createArrayType(tree type) {
+MigDIType DebugInfo::createArrayType(tree type) {
   // Add the dimensions of the array.  FIXME: This loses CV qualifiers from
   // interior arrays, do we care?  Why aren't nested arrays represented the
   // obvious/recursive way?
-  llvm::SmallVector<Value*, 8> Subscripts;
+#if LLVM_VERSION_CODE > LLVM_VERSION(3, 8)
+  llvm::SmallVector<Metadata*, 8>
+#else
+  llvm::SmallVector<Value*, 8>
+#endif
+      Subscripts;
 
   // There will be ARRAY_TYPE nodes for each rank.  Followed by the derived
   // type.
@@ -603,7 +770,11 @@ DIType DebugInfo::createArrayType(tree type) {
     Subscripts.push_back(Builder.getOrCreateSubrange(0, Length));
   }
 
-  llvm::DIArray SubscriptArray = Builder.getOrCreateArray(Subscripts);
+  MigDINodeArray SubscriptArray = Builder.getOrCreateArray(
+#if LLVM_VERSION_CODE > LLVM_VERSION(3, 8)
+          makeArrayRef
+#endif
+          (Subscripts));
   expanded_location Loc = GetNodeLocation(type);
   return CreateCompositeType(
       llvm::dwarf::DW_TAG_array_type, findRegion(TYPE_CONTEXT(type)),
@@ -612,9 +783,14 @@ DIType DebugInfo::createArrayType(tree type) {
 }
 
 /// createEnumType - Create EnumType.
-DIType DebugInfo::createEnumType(tree type) {
+MigDIType DebugInfo::createEnumType(tree type) {
   // enum { a, b, ..., z };
-  llvm::SmallVector<Value*, 32> Elements;
+#if LLVM_VERSION_CODE > LLVM_VERSION(3, 8)
+  llvm::SmallVector<Metadata*, 32>
+#else
+  llvm::SmallVector<Value*, 32>
+#endif
+      Elements;
 
   if (TYPE_SIZE(type)) {
     for (tree Link = TYPE_VALUES(type); Link; Link = TREE_CHAIN(Link)) {
@@ -627,7 +803,11 @@ DIType DebugInfo::createEnumType(tree type) {
     }
   }
 
-  llvm::DIArray EltArray = Builder.getOrCreateArray(Elements);
+  MigDINodeArray EltArray = Builder.getOrCreateArray(
+#if LLVM_VERSION_CODE > LLVM_VERSION(3, 8)
+          makeArrayRef
+#endif
+          (Elements));
 
   expanded_location Loc = {};
 
@@ -638,12 +818,17 @@ DIType DebugInfo::createEnumType(tree type) {
   return CreateCompositeType(
       llvm::dwarf::DW_TAG_enumeration_type, findRegion(TYPE_CONTEXT(type)),
       GetNodeName(type), getOrCreateFile(Loc.file), Loc.line,
-      NodeSizeInBits(type), NodeAlignInBits(type), 0, 0, llvm::DIType(),
+      NodeSizeInBits(type), NodeAlignInBits(type), 0, 0,
+#if LLVM_VERSION_CODE > LLVM_VERSION(3, 8)
+      0,
+#else
+      llvm::DIType(), /* RunTimeLang? */
+#endif
       EltArray);
 }
 
 /// createStructType - Create StructType for struct or union or class.
-DIType DebugInfo::createStructType(tree type) {
+MigDIType DebugInfo::createStructType(tree type) {
 
   // struct { a; b; ... z; }; | union { a; b; ... z; };
   unsigned Tag =
@@ -678,18 +863,29 @@ DIType DebugInfo::createStructType(tree type) {
   // final definition.
   expanded_location Loc = GetNodeLocation(TREE_CHAIN(type), false);
   unsigned SFlags = 0;
-  DIDescriptor TyContext = findRegion(TYPE_CONTEXT(type));
+  MigDIScope TyContext = findRegion(TYPE_CONTEXT(type));
 
   // Check if this type is created while creating context information
   // descriptor.
   {
-    std::map<tree_node *, WeakVH>::iterator I = TypeCache.find(type);
+    std::map<tree_node *, MigTrackingMDRefType>::iterator I = TypeCache.find(type);
     if (I != TypeCache.end())
-      if (MDNode *TN = dyn_cast_or_null<MDNode>(&*I->second))
+      if (MDNode *TN = cast<MDNode>(&*I->second))
+#if LLVM_VERSION_CODE > LLVM_VERSION(3, 8)
+        return dyn_cast_or_null<DIType>(TN);
+#else
         return DIType(TN);
+#endif
   }
 
-  llvm::DIType FwdDecl = Builder.createReplaceableForwardDecl(
+  MigDIType FwdDecl =
+#if LLVM_VERSION_CODE > LLVM_VERSION(3, 8)
+      Builder.createReplaceableCompositeType(
+#elif LLVM_VERSION_CODE > LLVM_VERSION(3, 3)
+      Builder.createReplaceableForwardDecl(
+#else
+      Builder.createForwardDecl(
+#endif
       Tag, GetNodeName(type), TyContext, getOrCreateFile(Loc.file), Loc.line,
       0, 0, 0);
 
@@ -699,21 +895,33 @@ DIType DebugInfo::createStructType(tree type) {
 
   // Insert into the TypeCache so that recursive uses will find it.
   llvm::MDNode *FDN = FwdDecl;
+#if LLVM_VERSION_CODE > LLVM_VERSION(3, 8)
+  llvm::TempMDNode FwdDeclNode(FDN);
+  TypeCache[type].reset(FwdDecl);
+  RegionStack.push_back(FwdDecl);
+  RegionMap[type].reset(FwdDecl);
+#else
   llvm::TrackingVH<llvm::MDNode> FwdDeclNode = FDN;
   TypeCache[type] = WeakVH(FwdDecl);
 
   // Push the struct on region stack.
   RegionStack.push_back(WeakVH(FwdDecl));
   RegionMap[type] = WeakVH(FwdDecl);
+#endif
 
   // Convert all the elements.
-  llvm::SmallVector<Value*, 16> EltTys;
+#if LLVM_VERSION_CODE > LLVM_VERSION(3, 8)
+  llvm::SmallVector<Metadata*, 16>
+#else
+  llvm::SmallVector<Value*, 16>
+#endif
+      EltTys;
 
   if (tree binfo = TYPE_BINFO(type)) {
     for (unsigned i = 0, e = BINFO_N_BASE_BINFOS(binfo); i != e; ++i) {
       tree BInfo = BINFO_BASE_BINFO(binfo, i);
       tree BInfoType = BINFO_TYPE(BInfo);
-      DIType BaseClass = getOrCreateType(BInfoType);
+      MigDIType BaseClass = getOrCreateType(BInfoType);
       unsigned BFlags = 0;
       if (BINFO_VIRTUAL_P(BInfo))
         BFlags = llvm::DIType::FlagVirtual;
@@ -733,8 +941,14 @@ DIType DebugInfo::createStructType(tree type) {
       if (BINFO_VIRTUAL_P(BInfo))
         Offset = 0 - getInt64(BINFO_VPTR_FIELD(BInfo), false);
       // FIXME : name, size, align etc...
-      DIType DTy = CreateDerivedType(
-          DW_TAG_inheritance, findRegion(type), StringRef(), llvm::DIFile(), 0,
+      MigDIType DTy = CreateDerivedType(
+          DW_TAG_inheritance, findRegion(type), StringRef(),
+#if LLVM_VERSION_CODE > LLVM_VERSION(3, 8)
+          nullptr,
+#else
+          llvm::DIFile(),
+#endif
+          0,
           0, 0, Offset, BFlags, BaseClass);
       EltTys.push_back(DTy);
     }
@@ -766,7 +980,7 @@ DIType DebugInfo::createStructType(tree type) {
 
     // Field type is the declared type of the field.
     tree FieldNodeType = FieldType(Member);
-    DIType MemberType = getOrCreateType(FieldNodeType);
+    MigDIType MemberType = getOrCreateType(FieldNodeType);
     StringRef MemberName = GetNodeName(Member);
     unsigned MFlags = 0;
     if (TREE_PROTECTED(Member))
@@ -774,7 +988,7 @@ DIType DebugInfo::createStructType(tree type) {
     else if (TREE_PRIVATE(Member))
       MFlags = llvm::DIType::FlagPrivate;
 
-    DIType DTy = CreateDerivedType(
+    MigDIType DTy = CreateDerivedType(
         DW_TAG_member, findRegion(DECL_CONTEXT(Member)), MemberName,
         getOrCreateFile(MemLoc.file), MemLoc.line, NodeSizeInBits(Member),
         NodeAlignInBits(FieldNodeType), int_bit_position(Member), MFlags,
@@ -782,7 +996,13 @@ DIType DebugInfo::createStructType(tree type) {
     EltTys.push_back(DTy);
   }
 
-  for (tree Member = TYPE_METHODS(type); Member; Member = TREE_CHAIN(Member)) {
+  for (tree Member =
+#if (GCC_MAJOR > 7)
+          TYPE_FIELDS(type);
+#else
+          TYPE_METHODS(type);
+#endif
+          Member; Member = TREE_CHAIN(Member)) {
 
     if (DECL_ABSTRACT_ORIGIN(Member))
       continue;
@@ -793,76 +1013,112 @@ DIType DebugInfo::createStructType(tree type) {
     if (DECL_P(Member) && DECL_IGNORED_P(Member))
       continue;
 
-    std::map<tree_node *, WeakVH>::iterator I = SPCache.find(Member);
+    std::map<tree_node *, MigTrackingMDRefType>::iterator I = SPCache.find(Member);
     if (I != SPCache.end())
-      EltTys.push_back(DISubprogram(cast<MDNode>(I->second)));
+      EltTys.push_back(
+#if LLVM_VERSION_CODE > LLVM_VERSION(3, 8)
+              dyn_cast_or_null<DISubprogram>(cast<MDNode>(I->second))
+#else
+              DISubprogram(cast<MDNode>(I->second))
+#endif
+              );
     else {
       // Get the location of the member.
       expanded_location MemLoc = GetNodeLocation(Member, false);
       StringRef MemberName = getFunctionName(Member);
       StringRef LinkageName = getLinkageName(Member);
-      DIType SPTy = getOrCreateType(TREE_TYPE(Member));
+      MigDIType SPTy = getOrCreateType(TREE_TYPE(Member));
       unsigned Virtuality = 0;
       unsigned VIndex = 0;
-      DIType ContainingType;
+      MigDIType ContainingType;
       if (DECL_VINDEX(Member)) {
+#if LLVM_VERSION_CODE > LLVM_VERSION(3, 8)
+        if (tree_fits_uhwi_p(DECL_VINDEX(Member)))
+          VIndex = tree_to_shwi(DECL_VINDEX(Member));
+#else
         if (host_integerp(DECL_VINDEX(Member), 0))
           VIndex = tree_low_cst(DECL_VINDEX(Member), 0);
+#endif
         Virtuality = dwarf::DW_VIRTUALITY_virtual;
         ContainingType = getOrCreateType(DECL_CONTEXT(Member));
       }
-      DISubprogram SP = CreateSubprogram(
+      MigDISubprogram SP = CreateSubprogram(
           findRegion(DECL_CONTEXT(Member)), MemberName, MemberName, LinkageName,
           getOrCreateFile(MemLoc.file), MemLoc.line, SPTy, false, false,
-          Virtuality, VIndex, ContainingType, DECL_ARTIFICIAL(Member),
+          ContainingType, Virtuality, VIndex, DECL_ARTIFICIAL(Member),
           optimize);
       EltTys.push_back(SP);
+#if LLVM_VERSION_CODE > LLVM_VERSION(3, 8)
+      SPCache[Member].reset(SP);
+#else
       SPCache[Member] = WeakVH(SP);
+#endif
     }
   }
 
-  llvm::DIArray Elements = Builder.getOrCreateArray(EltTys);
+  MigDINodeArray Elements = Builder.getOrCreateArray(EltTys);
 
   RegionStack.pop_back();
-  std::map<tree_node *, WeakVH>::iterator RI = RegionMap.find(type);
+  std::map<tree_node *, MigTrackingMDRefType>::iterator RI = RegionMap.find(type);
   if (RI != RegionMap.end())
     RegionMap.erase(RI);
 
-  llvm::DIType ContainingType;
+  MigDIType ContainingType;
   if (TYPE_VFIELD(type)) {
     tree vtype = DECL_FCONTEXT(TYPE_VFIELD(type));
     ContainingType = getOrCreateType(vtype);
   }
-  llvm::DICompositeType RealDecl = CreateCompositeType(
+  MigDICompositeType RealDecl = CreateCompositeType(
       Tag, findRegion(TYPE_CONTEXT(type)), GetNodeName(type),
       getOrCreateFile(Loc.file), Loc.line, NodeSizeInBits(type),
-      NodeAlignInBits(type), 0, SFlags, llvm::DIType(), Elements, RunTimeLang,
+      NodeAlignInBits(type), 0, SFlags,
+#if LLVM_VERSION_CODE > LLVM_VERSION(3, 8)
+      nullptr,
+#else
+      llvm::DIType(),
+#endif
+      Elements, RunTimeLang,
       ContainingType);
+#if LLVM_VERSION_CODE > LLVM_VERSION(3, 8)
+  RegionMap[type].reset(RealDecl);
+#else
   RegionMap[type] = WeakVH(RealDecl);
+#endif
 
   // Now that we have a real decl for the struct, replace anything using the
-  // old decl with the new one.  This will recursively update the debug info.
+  // old decl with the new one.  This will recursively update the debug info
+#if LLVM_VERSION_CODE > LLVM_VERSION(3, 8)
+  FwdDeclNode->replaceAllUsesWith(RealDecl);
+#else
   llvm::DIType(FwdDeclNode).replaceAllUsesWith(RealDecl);
+#endif
 
   return RealDecl;
 }
 
 /// createVariantType - Create variant type or return MainTy.
-DIType DebugInfo::createVariantType(tree type, DIType MainTy) {
-
-  DIType Ty;
+MigDIType DebugInfo::createVariantType(tree type, MigDIType MainTy) {
+  MigDIType Ty;
   if (tree TyDef = TYPE_NAME(type)) {
-    std::map<tree_node *, WeakVH>::iterator I = TypeCache.find(TyDef);
+    std::map<tree_node *, MigTrackingMDRefType>::iterator I = TypeCache.find(TyDef);
     if (I != TypeCache.end())
       if (I->second)
+#if LLVM_VERSION_CODE > LLVM_VERSION(3, 8)
+        return dyn_cast_or_null<DIType>(cast<MDNode>(I->second));
+#else
         return DIType(cast<MDNode>(I->second));
+#endif
     if (isa<TYPE_DECL>(TyDef) && DECL_ORIGINAL_TYPE(TyDef)) {
       expanded_location TypeDefLoc = GetNodeLocation(TyDef);
       Ty = CreateDerivedType(
           DW_TAG_typedef, findRegion(DECL_CONTEXT(TyDef)), GetNodeName(TyDef),
           getOrCreateFile(TypeDefLoc.file), TypeDefLoc.line, 0 /*size*/,
           0 /*align*/, 0 /*offset */, 0 /*flags*/, MainTy);
+#if LLVM_VERSION_CODE > LLVM_VERSION(3, 8)
+      TypeCache[TyDef].reset(Ty);
+#else
       TypeCache[TyDef] = WeakVH(Ty);
+#endif
       return Ty;
     }
   }
@@ -884,7 +1140,11 @@ DIType DebugInfo::createVariantType(tree type, DIType MainTy) {
         0 /* flags */, MainTy);
 
   if (TYPE_VOLATILE(type) || TYPE_READONLY(type)) {
+#if LLVM_VERSION_CODE > LLVM_VERSION(3, 8)
+    TypeCache[type].reset(Ty);
+#else
     TypeCache[type] = WeakVH(Ty);
+#endif
     return Ty;
   }
 
@@ -894,45 +1154,60 @@ DIType DebugInfo::createVariantType(tree type, DIType MainTy) {
 
 /// getOrCreateType - Get the type from the cache or create a new type if
 /// necessary.
-DIType DebugInfo::getOrCreateType(tree type) {
+MigDIType DebugInfo::getOrCreateType(tree type) {
   if (type == NULL_TREE || type == error_mark_node)
     llvm_unreachable("Not a type.");
 
   // Should only be void if a pointer/reference/return type.  Returning NULL
   // allows the caller to produce a non-derived type.
   if (isa<VOID_TYPE>(type))
+#if LLVM_VERSION_CODE > LLVM_VERSION(3, 8)
+    return nullptr;
+#else
     return DIType();
+#endif
 
   // Check to see if the compile unit already has created this type.
-  std::map<tree_node *, WeakVH>::iterator I = TypeCache.find(type);
+  std::map<tree_node *, MigTrackingMDRefType>::iterator I = TypeCache.find(type);
   if (I != TypeCache.end())
     if (I->second)
+#if LLVM_VERSION_CODE > LLVM_VERSION(3, 8)
+      return dyn_cast_or_null<DIType>(cast<MDNode>(I->second));
+#else
       return DIType(cast<MDNode>(I->second));
+#endif
 
   if (type != TYPE_MAIN_VARIANT(type) && TYPE_MAIN_VARIANT(type)) {
-    DIType MainTy = getOrCreateType(TYPE_MAIN_VARIANT(type));
-    DIType Ty = createVariantType(type, MainTy);
+    MigDIType MainTy = getOrCreateType(TYPE_MAIN_VARIANT(type));
+    MigDIType Ty = createVariantType(type, MainTy);
+#if LLVM_VERSION_CODE < LLVM_VERSION(3, 9)
     if (Ty.isValid())
+#endif
       return Ty;
   }
 
   // Work out details of type.
-  DIType Ty;
+  MigDIType Ty;
   switch (TREE_CODE(type)) {
   case ERROR_MARK:
+#if LLVM_VERSION_CODE < LLVM_VERSION(3, 4)
+  case LANG_TYPE:
+#endif
   case TRANSLATION_UNIT_DECL:
   default:
     llvm_unreachable("Unsupported type");
 
-#if (GCC_MINOR > 5)
+#if GCC_VERSION_CODE > GCC_VERSION(4, 5)
   case NULLPTR_TYPE:
 #endif
+#if LLVM_VERSION_CODE > LLVM_VERSION(3, 3)
   case LANG_TYPE: {
     tree name = TYPE_NAME(type);
     if (TREE_CODE(name) == TYPE_DECL)
       name = DECL_NAME(name);
     return Builder.createUnspecifiedType(IDENTIFIER_POINTER(name));
   }
+#endif
 
   case OFFSET_TYPE:
   case POINTER_TYPE:
@@ -967,7 +1242,11 @@ DIType DebugInfo::getOrCreateType(tree type) {
     Ty = createBasicType(type);
     break;
   }
+#if LLVM_VERSION_CODE > LLVM_VERSION(3, 8)
+  TypeCache[type].reset(Ty);
+#else
   TypeCache[type] = WeakVH(Ty);
+#endif
   return Ty;
 }
 
@@ -978,8 +1257,10 @@ void DebugInfo::Initialize() {
 
   // Debug info metadata without a version or with an outdated version will be
   // dropped. Add a version here to avoid that.
+#if LLVM_VERSION_CODE > LLVM_VERSION(3, 3)
   M.addModuleFlag(llvm::Module::Error, "Debug Info Version",
                   llvm::DEBUG_METADATA_VERSION);
+#endif
   // Each input file is encoded as a separate compile unit in LLVM
   // debugging information output. However, many target specific tool chains
   // prefer to encode only one compile unit in an object file. In this
@@ -1033,12 +1314,17 @@ void DebugInfo::getOrCreateCompileUnit(const char *FullPath, bool isMain) {
   unsigned ObjcRunTimeVer = 0;
   //  if (flag_objc_abi != 0 && flag_objc_abi != -1)
   //    ObjcRunTimeVer = flag_objc_abi;
-  Builder.createCompileUnit(LangTag, FileName, Directory, version_string,
-                            optimize, Flags, ObjcRunTimeVer);
+  Builder.createCompileUnit(LangTag,
+#if LLVM_VERSION_CODE > LLVM_VERSION(3, 9)
+                            Builder.createFile(FileName, Directory),
+#else
+                            FileName, Directory,
+#endif
+                            version_string, optimize, Flags, ObjcRunTimeVer);
 }
 
 /// getOrCreateFile - Get DIFile descriptor.
-DIFile DebugInfo::getOrCreateFile(const char *FullPath) {
+MigDIFile DebugInfo::getOrCreateFile(const char *FullPath) {
   if (!FullPath)
     FullPath = main_input_filename;
   if (!strcmp(FullPath, ""))
@@ -1059,15 +1345,27 @@ DIFile DebugInfo::getOrCreateFile(const char *FullPath) {
 
 /// CreateDerivedType - Create a derived type like const qualified type,
 /// pointer, typedef, etc.
-DIDerivedType DebugInfo::CreateDerivedType(
-    unsigned Tag, DIDescriptor Context, StringRef Name, DIFile F,
-    unsigned LineNumber, uint64_t SizeInBits, uint64_t AlignInBits,
-    uint64_t OffsetInBits, unsigned Flags, DIType DerivedFrom) {
+#if LLVM_VERSION_CODE > LLVM_VERSION(3, 8)
+DIDerivedType *
+#else
+DIDerivedType
+#endif
+DebugInfo::CreateDerivedType(unsigned Tag, MigDIScope Context, StringRef Name,
+    MigDIFile F, unsigned LineNumber, uint64_t SizeInBits, uint64_t AlignInBits,
+    uint64_t OffsetInBits, unsigned Flags, MigDIType DerivedFrom) {
+#if LLVM_VERSION_CODE > LLVM_VERSION(3, 9)
+  DINode::DIFlags MigFlags = DINode::FlagZero;
+#else
+  unsigned MigFlags = Flags;
+#endif
   switch (Tag) {
   case dwarf::DW_TAG_typedef:
     return Builder.createTypedef(DerivedFrom, Name, F, LineNumber, Context);
   case dwarf::DW_TAG_pointer_type:
     return Builder.createPointerType(DerivedFrom, SizeInBits, AlignInBits,
+#if LLVM_VERSION_CODE > LLVM_VERSION(4, 0)
+                                     None,
+#endif
                                      Name);
   case dwarf::DW_TAG_reference_type:
   case dwarf::DW_TAG_rvalue_reference_type:
@@ -1078,11 +1376,19 @@ DIDerivedType DebugInfo::CreateDerivedType(
     return Builder.createQualifiedType(Tag, DerivedFrom);
   case dwarf::DW_TAG_member:
     return Builder.createMemberType(Context, Name, F, LineNumber, SizeInBits,
-                                    AlignInBits, OffsetInBits, Flags,
+                                    AlignInBits, OffsetInBits,
+                                    MigFlags,
                                     DerivedFrom);
   case dwarf::DW_TAG_inheritance:
-    return Builder.createInheritance(DIType(Context), DerivedFrom, OffsetInBits,
-                                     Flags);
+    return Builder.createInheritance(
+#if LLVM_VERSION_CODE > LLVM_VERSION(3, 8)
+                                     dyn_cast_or_null<DIType>(Context),
+#else
+                                     DIType(Context),
+#endif
+                                     DerivedFrom, OffsetInBits,
+                                     MigFlags
+                                     );
   case dwarf::DW_TAG_friend:
   case dwarf::DW_TAG_ptr_to_member_type:
     break;
@@ -1091,22 +1397,37 @@ DIDerivedType DebugInfo::CreateDerivedType(
 }
 
 /// CreateCompositeType - Create a composite type like array, struct, etc.
-DICompositeType DebugInfo::CreateCompositeType(
-    unsigned Tag, DIDescriptor Context, StringRef Name, DIFile F,
+MigDICompositeType DebugInfo::CreateCompositeType(
+    unsigned Tag, MigDIScope Context, StringRef Name, MigDIFile F,
     unsigned LineNumber, uint64_t SizeInBits, uint64_t AlignInBits,
-    uint64_t OffsetInBits, unsigned Flags, DIType DerivedFrom, DIArray Elements,
-    unsigned RuntimeLang, MDNode *ContainingType) {
+    uint64_t OffsetInBits, unsigned Flags, MigDIType DerivedFrom,
+    MigDINodeArray Elements, unsigned RuntimeLang, MDNode *ContainingType) {
+#if LLVM_VERSION_CODE > LLVM_VERSION(3, 9)
+  DINode::DIFlags MigFlags = DINode::FlagZero;
+#else
+  unsigned MigFlags = Flags;
+#endif
   switch (Tag) {
   case dwarf::DW_TAG_array_type:
     return Builder.createArrayType(SizeInBits, AlignInBits, DerivedFrom,
                                    Elements);
   case dwarf::DW_TAG_structure_type:
     return Builder.createStructType(Context, Name, F, LineNumber, SizeInBits,
-                                    AlignInBits, Flags, DerivedFrom, Elements,
-                                    0, DIType(ContainingType));
+                                    AlignInBits,
+                                    MigFlags,
+                                    DerivedFrom, Elements,
+                                    0,
+#if LLVM_VERSION_CODE > LLVM_VERSION(3, 8)
+                                    dyn_cast_or_null<DIType>(ContainingType)
+#else
+                                    DIType(ContainingType)
+#endif
+                                    );
   case dwarf::DW_TAG_union_type:
     return Builder.createUnionType(Context, Name, F, LineNumber, SizeInBits,
-                                   AlignInBits, Flags, Elements, RuntimeLang);
+                                   AlignInBits,
+                                   MigFlags,
+                                   Elements, RuntimeLang);
   case dwarf::DW_TAG_enumeration_type:
     return Builder.createEnumerationType(Context, Name, F, LineNumber,
                                          SizeInBits, AlignInBits, Elements,
@@ -1122,35 +1443,74 @@ DICompositeType DebugInfo::CreateCompositeType(
 /// CreateSubprogram - Create a new descriptor for the specified subprogram.
 /// See comments in DISubprogram for descriptions of these fields.  This
 /// method does not unique the generated descriptors.
-DISubprogram DebugInfo::CreateSubprogram(
-    DIDescriptor Context, StringRef Name, StringRef DisplayName,
-    StringRef LinkageName, DIFile F, unsigned LineNo, DIType Ty,
-    bool isLocalToUnit, bool isDefinition, unsigned VK, unsigned VIndex,
-    DIType ContainingType, unsigned Flags, bool isOptimized, Function *Fn) {
+MigDISubprogram DebugInfo::CreateSubprogram(
+    MigDIScope Context, StringRef Name, StringRef DisplayName,
+    StringRef LinkageName, MigDIFile F, unsigned LineNo, MigDIType Ty,
+    bool isLocalToUnit, bool isDefinition, MigDIType ContainingType,
+    unsigned VK, unsigned VIndex, unsigned Flags, bool isOptimized,
+    Function *Fn) {
+#if LLVM_VERSION_CODE > LLVM_VERSION(3, 9)
+  DINode::DIFlags MigFlags = DINode::FlagZero;
+#else
+  unsigned MigFlags = Flags;
+#endif
+#if LLVM_VERSION_CODE > LLVM_VERSION(3, 8)
+  DISubroutineType *CTy = dyn_cast_or_null<DISubroutineType>(Ty);
+#else
   DICompositeType CTy = getDICompositeType(Ty);
   assert(CTy.Verify() && "Expected a composite type!");
-  if (ContainingType.isValid() || VK || VIndex)
+#endif
+  if (
+#if LLVM_VERSION_CODE < LLVM_VERSION(3, 9)
+      ContainingType.isValid() ||
+#endif
+      VK || VIndex)
     return Builder.createMethod(Context, Name, LinkageName, F, LineNo, CTy,
                                 isLocalToUnit, isDefinition, VK, VIndex,
+#if LLVM_VERSION_CODE > LLVM_VERSION(3, 8)
+                                0, /* ThisAdjustment */
+                                nullptr,
+#else
                                 DIType(),
-                                Flags, isOptimized, Fn, NULL);
+#endif
+                                MigFlags, isOptimized,
+#if LLVM_VERSION_CODE < LLVM_VERSION(3, 9)
+                                Fn,
+#endif
+                                NULL);
   return Builder.createFunction(Context, Name, LinkageName, F, LineNo, CTy,
-                                isLocalToUnit, isDefinition, LineNo, Flags,
-                                isOptimized, Fn, NULL, NULL);
+                                isLocalToUnit, isDefinition, LineNo, MigFlags,
+                                isOptimized,
+#if LLVM_VERSION_CODE < LLVM_VERSION(3, 9)
+                                Fn,
+#endif
+                                NULL, NULL);
 }
 
 /// CreateSubprogramDefinition - Create new subprogram descriptor for the
 /// given declaration.
-DISubprogram DebugInfo::CreateSubprogramDefinition(
+MigDISubprogram DebugInfo::CreateSubprogramDefinition(
+#if LLVM_VERSION_CODE > LLVM_VERSION(3, 8)
+    DISubprogram *SP, unsigned LineNo, Function *Fn) {
+  if (SP->isDefinition())
+    return SP;
+
+  MigDIFile File = Builder.createFile(SP->getFilename(), SP->getDirectory());
+  return Builder.createFunction(dyn_cast_or_null<DIScope>(SP->getScope()),
+      SP->getName(), SP->getLinkageName(), File, LineNo, SP->getType(),
+      SP->isLocalToUnit(), true, LineNo, SP->getFlags(), SP->isOptimized(),
+      SP->getTemplateParams(), SP);
+#else
     DISubprogram &SP, unsigned LineNo, Function *Fn) {
   if (SP.isDefinition())
     return DISubprogram(SP);
 
-  DIFile File = Builder.createFile(SP.getFilename(), SP.getDirectory());
+  MigDIFile File = Builder.createFile(SP.getFilename(), SP.getDirectory());
   return Builder.createFunction(
       SP.getContext(), SP.getName(), SP.getLinkageName(), File,
       SP.getLineNumber(), SP.getType(), SP.isLocalToUnit(), true, LineNo,
       SP.getFlags(), SP.isOptimized(), Fn, SP.getTemplateParams(), SP);
+#endif
 }
 
 //===----------------------------------------------------------------------===//
@@ -1165,7 +1525,14 @@ Instruction *DebugInfo::InsertDeclare(Value *Storage, DIVariable D,
   if (!DeclareFn)
     DeclareFn = Intrinsic::getDeclaration(&M, Intrinsic::dbg_declare);
 
-  Value *Args[] = { MDNode::get(Storage->getContext(), Storage), D };
+  Value *Args[] = {
+#if LLVM_VERSION_CODE > LLVM_VERSION(3, 8)
+    MetadataAsValue::get(Storage->getContext(), ValueAsMetadata::get(Storage)),
+    MetadataAsValue::get(Storage->getContext(), &D)
+#else
+    MDNode::get(Storage->getContext(), Storage), D
+#endif
+  };
   return CallInst::Create(DeclareFn, Args, "", InsertBefore);
 }
 
@@ -1177,7 +1544,14 @@ Instruction *DebugInfo::InsertDeclare(Value *Storage, DIVariable D,
   if (!DeclareFn)
     DeclareFn = Intrinsic::getDeclaration(&M, Intrinsic::dbg_declare);
 
-  Value *Args[] = { MDNode::get(Storage->getContext(), Storage), D };
+  Value *Args[] = {
+#if LLVM_VERSION_CODE > LLVM_VERSION(3, 8)
+     MetadataAsValue::get(Storage->getContext(), ValueAsMetadata::get(Storage)),
+     MetadataAsValue::get(Storage->getContext(), &D)
+#else
+     MDNode::get(Storage->getContext(), Storage), D
+#endif
+  };
 
   // If this block already has a terminator then insert this intrinsic
   // before the terminator.
@@ -1195,9 +1569,19 @@ Instruction *DebugInfo::InsertDbgValueIntrinsic(
   if (!ValueFn)
     ValueFn = Intrinsic::getDeclaration(&M, Intrinsic::dbg_value);
 
-  Value *Args[] = { MDNode::get(V->getContext(), V),
-                    ConstantInt::get(Type::getInt64Ty(V->getContext()), Offset),
-                    D };
+  Value *Args[] = {
+#if LLVM_VERSION_CODE > LLVM_VERSION(3, 8)
+      MetadataAsValue::get(V->getContext(), ValueAsMetadata::get(V)),
+#else
+      MDNode::get(V->getContext(), V),
+#endif
+      ConstantInt::get(Type::getInt64Ty(V->getContext()), Offset),
+#if LLVM_VERSION_CODE > LLVM_VERSION(3, 8)
+      MetadataAsValue::get(V->getContext(), &D)
+#else
+      D
+#endif
+  };
   return CallInst::Create(ValueFn, Args, "", InsertBefore);
 }
 
@@ -1209,8 +1593,18 @@ Instruction *DebugInfo::InsertDbgValueIntrinsic(
   if (!ValueFn)
     ValueFn = Intrinsic::getDeclaration(&M, Intrinsic::dbg_value);
 
-  Value *Args[] = { MDNode::get(V->getContext(), V),
-                    ConstantInt::get(Type::getInt64Ty(V->getContext()), Offset),
-                    D };
+  Value *Args[] = {
+#if LLVM_VERSION_CODE > LLVM_VERSION(3, 8)
+      MetadataAsValue::get(V->getContext(), ValueAsMetadata::get(V)),
+#else
+      MDNode::get(V->getContext(), V),
+#endif
+      ConstantInt::get(Type::getInt64Ty(V->getContext()), Offset),
+#if LLVM_VERSION_CODE > LLVM_VERSION(3, 8)
+      MetadataAsValue::get(V->getContext(), &D)
+#else
+      D
+#endif
+  };
   return CallInst::Create(ValueFn, Args, "", InsertAtEnd);
 }

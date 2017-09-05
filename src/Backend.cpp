@@ -31,20 +31,38 @@
 // LLVM headers
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/StringExtras.h"
+#if LLVM_VERSION_CODE >= LLVM_VERSION(3, 9)
+#if LLVM_VERSION_CODE > LLVM_VERSION(3, 9)
+#include "llvm/Bitcode/BitcodeReader.h"
+#include "llvm/Bitcode/BitcodeWriter.h"
+#include "llvm/Transforms/IPO/AlwaysInliner.h"
+#endif
+#include "llvm/IR/LegacyPassManager.h"
+#include "llvm/Analysis/TargetLibraryInfo.h"
+#include "llvm/Target/TargetOptions.h"
+#include "llvm/Target/TargetMachine.h"
+#include "llvm/Analysis/TargetTransformInfo.h"
+#else
 #include "llvm/Bitcode/ReaderWriter.h"
+#include "llvm/PassManager.h"
+#include "llvm/Target/TargetLibraryInfo.h"
+#endif
 #include "llvm/CodeGen/RegAllocRegistry.h"
 #include "llvm/IR/DataLayout.h"
+#if LLVM_VERSION_CODE > LLVM_VERSION(3, 3)
 #include "llvm/IR/IRPrintingPasses.h"
+#include "llvm/IR/Verifier.h"
+#else
+#include "llvm/Analysis/Verifier.h"
+#include "llvm/Assembly/PrintModulePass.h"
+#endif
 #include "llvm/IR/LLVMContext.h"
 #include "llvm/IR/Module.h"
-#include "llvm/IR/Verifier.h"
 #include "llvm/MC/SubtargetFeature.h"
-#include "llvm/PassManager.h"
 #include "llvm/Support/FileSystem.h"
 #include "llvm/Support/ManagedStatic.h"
 #include "llvm/Support/SourceMgr.h"
 #include "llvm/Support/TargetRegistry.h"
-#include "llvm/Target/TargetLibraryInfo.h"
 #include "llvm/Target/TargetSubtargetInfo.h"
 #include "llvm/Transforms/IPO.h"
 #include "llvm/Transforms/IPO/PassManagerBuilder.h"
@@ -76,6 +94,12 @@ extern "C" {
 #include "diagnostic.h"
 #include "flags.h"
 #include "gcc-plugin.h"
+#if (GCC_MAJOR > 4)
+#include "cgraph.h"
+#include "stor-layout.h"
+#include "context.h"
+#include "stringpool.h"
+#endif
 #include "intl.h"
 #include "langhooks.h"
 #include "output.h"
@@ -85,9 +109,16 @@ extern "C" {
 #endif
 #include "target.h" // For targetm.
 #include "toplev.h"
+#if (GCC_MAJOR > 4)
+#include "tree-cfg.h"
+#else
 #include "tree-flow.h"
+#endif
 #include "tree-pass.h"
 #include "version.h"
+#if (GCC_MAJOR > 7)
+#include "attribs.h"
+#endif
 
 // TODO: In GCC, add targhooks.h to the list of plugin headers and remove this.
 tree default_mangle_decl_assembler_name(tree, tree);
@@ -98,8 +129,9 @@ tree default_mangle_decl_assembler_name(tree, tree);
 // Trees header.
 #include "dragonegg/Trees.h"
 
-#if (GCC_MAJOR != 4)
-#error Unsupported GCC major version
+#if (GCC_MAJOR < 4 || LLVM_VERSION_MAJOR < 3)
+#pragma error("Experimental only support GCC v4.x, v5.x, v6.x, v7.x, v8.x and "
+              "LLVM v3.x, v4.x, v5.x")
 #endif
 
 using namespace llvm;
@@ -109,7 +141,7 @@ int flag_no_simplify_libcalls;
 
 // Whether -fno-builtin was specified.
 // In GCC < 4.6, this variable is only defined in C family front ends.
-#if (GCC_MINOR < 6)
+#if GCC_VERSION_CODE < GCC_VERSION(4, 6)
 extern int flag_no_builtin __attribute__((weak));
 #endif
 
@@ -131,8 +163,14 @@ DebugInfo *TheDebugInfo = 0;
 PassManagerBuilder PassBuilder;
 TargetMachine *TheTarget = 0;
 TargetFolder *TheFolder = 0;
+TargetOptions TargetOpts;
+#if LLVM_VERSION_CODE > LLVM_VERSION(3, 3)
+std::unique_ptr<raw_fd_ostream> OutStream;
+std::unique_ptr<raw_pwrite_stream> FormattedOutStream;
+#else
 raw_ostream *OutStream = 0; // Stream to write assembly code to.
 formatted_raw_ostream FormattedOutStream;
+#endif
 
 static bool DebugPassArguments;
 static bool DebugPassStructure;
@@ -151,15 +189,27 @@ std::vector<Constant *> AttributeAnnotateGlobals;
 /// PerFunctionPasses - This is the list of cleanup passes run per-function
 /// as each is compiled.  In cases where we are not doing IPO, it includes the
 /// code generator.
+#if LLVM_VERSION_CODE > LLVM_VERSION(3, 8)
+static legacy::FunctionPassManager *PerFunctionPasses = 0;
+static legacy::PassManager *PerModulePasses = 0;
+static legacy::PassManager *CodeGenPasses = 0;
+#else
 static FunctionPassManager *PerFunctionPasses = 0;
 static PassManager *PerModulePasses = 0;
-static PassManager *CodeGenPasses = 0;
+static FunctionPassManager *CodeGenPasses = 0;
+#endif
+
+#if LLVM_VERSION_CODE > LLVM_VERSION(3, 8)
+static LLVMContext TheContext;
+#else
+static LLVMContext &TheContext = getGlobalContext();
+#endif
 
 static void createPerFunctionOptimizationPasses();
 static void createPerModuleOptimizationPasses();
 
 // Compatibility hacks for older versions of GCC.
-#if (GCC_MINOR < 8)
+#if GCC_VERSION_CODE < GCC_VERSION(4, 8)
 
 static struct cgraph_node *cgraph_symbol(struct cgraph_node *N) { return N; }
 static struct varpool_node *varpool_symbol(struct varpool_node *N) { return N; }
@@ -177,6 +227,23 @@ static struct varpool_node *varpool_symbol(struct varpool_node *N) { return N; }
 
 #define FOR_EACH_VARIABLE(node) \
   for ((node) = varpool_nodes; (node); (node) = (node)->next)
+
+#elif (GCC_MAJOR > 4)
+
+#define asm_nodes symtab->first_asm_symbol()
+
+static inline struct cgraph_node *
+ipa_ref_referring_node(struct ipa_ref *ref) {
+  return reinterpret_cast<cgraph_node *>(ref->referring);
+}
+
+static inline struct varpool_node *
+ipa_ref_referring_varpool_node(struct ipa_ref *ref) {
+  return reinterpret_cast<varpool_node *>(ref->referring);
+}
+
+static symtab_node *cgraph_symbol(cgraph_node *N) { return N; }
+static symtab_node *varpool_symbol(varpool_node *N) { return N; }
 
 #else
 
@@ -314,10 +381,20 @@ static bool SizeOfGlobalMatchesDecl(GlobalValue *GV, tree decl) {
   // TODO: Change getTypeSizeInBits for aggregate types so it is no longer
   // rounded up to the alignment.
   uint64_t gcc_size = getInt64(DECL_SIZE(decl), true);
-  const DataLayout *DL = TheTarget->getSubtargetImpl()->getDataLayout();
+  const DataLayout *DL =
+#if LLVM_VERSION_CODE > LLVM_VERSION(3, 8)
+      TheModule->getDataLayout();
+#else
+      TheTarget->getSubtargetImpl()->getDataLayout();
+#endif
   unsigned Align = 8 * DL->getABITypeAlignment(Ty);
-  return TheTarget->getSubtargetImpl()->getDataLayout()->getTypeAllocSizeInBits(
-             Ty) == ((gcc_size + Align - 1) / Align) * Align;
+  return
+#if LLVM_VERSION_CODE > LLVM_VERSION(3, 8)
+       TheModule->getDataLayout()->getTypeAllocSizeInBits(Ty)
+#else
+       TheTarget->getSubtargetImpl()->getDataLayout()->getTypeAllocSizeInBits(Ty)
+#endif
+       == ((gcc_size + Align - 1) / Align) * Align;
 }
 #endif
 
@@ -362,7 +439,11 @@ static void ConfigureLLVM(void) {
   if (!quiet_flag || flag_detailed_statistics)
     Args.push_back("--stats");
   if (flag_verbose_asm)
+#if (GCC_MAJOR > 4)
+    Args.push_back("-dag-dump-verbose");
+#else
     Args.push_back("--asm-verbose");
+#endif
   if (DebugPassStructure)
     Args.push_back("--debug-pass=Structure");
   if (DebugPassArguments)
@@ -447,8 +528,29 @@ static std::string ComputeTargetTriple() {
   return NewTriple;
 }
 
+#if LLVM_VERSION_CODE > LLVM_VERSION(3, 8)
+static void setNoFramePointerElim(bool NoFramePointerElim) {
+  for (auto &F : *TheModule) {
+    auto Attrs = F.getAttributes();
+    StringRef Value(NoFramePointerElim ? "false" : "true");
+    Attrs = Attrs.addAttribute(F.getContext(),
+#if LLVM_VERSION_CODE > LLVM_VERSION(3, 9)
+                               AttributeList::FunctionIndex,
+#else
+                               AttributeSet::FunctionIndex,
+#endif
+                               "no-frame-pointer-elim", Value);
+    F.setAttributes(Attrs);
+  }
+}
+#endif
+
 /// CreateTargetMachine - Create the TargetMachine we will generate code with.
 static void CreateTargetMachine(const std::string &TargetTriple) {
+  // Create the module itself.
+  StringRef ModuleID = main_input_filename ? main_input_filename : "";
+  TheModule = new Module(ModuleID, TheContext);
+
   // FIXME: Figure out how to select the target and pass down subtarget info.
   std::string Err;
   const Target *TME = TargetRegistry::lookupTarget(TargetTriple, Err);
@@ -468,28 +570,39 @@ static void CreateTargetMachine(const std::string &TargetTriple) {
 
   // The target can set LLVM_SET_RELOC_MODEL to configure the relocation model
   // used by the LLVM backend.
+#if LLVM_VERSION_CODE > LLVM_VERSION(3, 8)
+  auto RelocModel = Optional<Reloc::Model>();
+#else
   Reloc::Model RelocModel = Reloc::Default;
+#endif
 #ifdef LLVM_SET_RELOC_MODEL
   LLVM_SET_RELOC_MODEL(RelocModel);
 #endif
 
   // The target can set LLVM_SET_CODE_MODEL to configure the code model used
   // used by the LLVM backend.
+#if LLVM_VERSION_MAJOR > 5
+  auto CMModel = Optional<CodeModel::Model>();
+#else
   CodeModel::Model CMModel = CodeModel::Default;
+#endif
 #ifdef LLVM_SET_CODE_MODEL
   LLVM_SET_CODE_MODEL(CMModel);
 #endif
 
-  TargetOptions Options;
-
-  // Set frame pointer elimination mode.
+  // https://reviews.llvm.org/D9830
+#if LLVM_VERSION_CODE > LLVM_VERSION(3, 8)
+  setNoFramePointerElim(flag_omit_frame_pointer);
+#else
   if (flag_omit_frame_pointer) {
     // Eliminate frame pointers everywhere.
-    Options.NoFramePointerElim = false;
+    TargetOpts.NoFramePointerElim = false;
   } else {
     // Keep frame pointers everywhere.
-    Options.NoFramePointerElim = true;
+    TargetOpts.NoFramePointerElim = true;
   }
+#endif
+
   // If a target has an option to eliminate frame pointers in leaf functions
   // only then it should set
   //   NoFramePointerElim = false;
@@ -497,9 +610,9 @@ static void CreateTargetMachine(const std::string &TargetTriple) {
   // in its LLVM_SET_TARGET_MACHINE_OPTIONS method when this option is true.
 
 #ifdef HAVE_INITFINI_ARRAY
-  Options.UseInitArray = true;
+  TargetOpts.UseInitArray = true;
 #else
-  Options.UseInitArray = false;
+  TargetOpts.UseInitArray = false;
 #endif
 
   // TODO: Set float ABI type.
@@ -507,12 +620,12 @@ static void CreateTargetMachine(const std::string &TargetTriple) {
   // TODO: Set FP fusion mode.
 
   // TODO: LessPreciseFPMADOption.
-  Options.NoInfsFPMath = flag_finite_math_only;
-  Options.NoNaNsFPMath = flag_finite_math_only;
-  Options.NoZerosInBSS = !flag_zero_initialized_in_bss;
-  Options.UnsafeFPMath =
-#if (GCC_MINOR > 5)
-      fast_math_flags_set_p(&global_options);
+  TargetOpts.NoInfsFPMath = flag_finite_math_only;
+  TargetOpts.NoNaNsFPMath = flag_finite_math_only;
+  TargetOpts.NoZerosInBSS = !flag_zero_initialized_in_bss;
+  TargetOpts.UnsafeFPMath =
+#if GCC_VERSION_CODE > GCC_VERSION(4, 5)
+  fast_math_flags_set_p(&global_options);
 #else
   fast_math_flags_set_p();
 #endif
@@ -522,26 +635,67 @@ static void CreateTargetMachine(const std::string &TargetTriple) {
   // TODO: DisableTailCalls.
   // TODO: TrapFuncName.
   // TODO: -fsplit-stack
-  Options.PositionIndependentExecutable = flag_pie;
+  // https://reviews.llvm.org/D19733
+#if LLVM_VERSION_CODE > LLVM_VERSION(3, 8)
+  TheModule->setPIELevel(PIELevel::Large);
+#else
+  TargetOpts.PositionIndependentExecutable = flag_pie;
+#endif
 
 #ifdef LLVM_SET_TARGET_MACHINE_OPTIONS
-  LLVM_SET_TARGET_MACHINE_OPTIONS(Options);
+#if LLVM_VERSION_CODE > LLVM_VERSION(3, 8)
+#ifdef TARGET_OMIT_LEAF_FRAME_POINTER
+  // X86
+  setNoFramePointerElim(TARGET_OMIT_LEAF_FRAME_POINTER);
+#else
+  // ARM
+  {
+    if (TARGET_SOFT_FLOAT) {
+#ifdef DRAGONEGG_DEBUG
+      printf("DEBUG: %s, line %d: %s: softfp\n", __FILE__, __LINE__, __func__);
 #endif
+      TargetOpts.FloatABIType = llvm::FloatABI::Soft;
+    }
+    if (TARGET_HARD_FLOAT_ABI) {
+#ifdef DRAGONEGG_DEBUG
+      printf("DEBUG: %s, line %d: %s: hard\n", __FILE__, __LINE__, __func__);
+#endif
+      TargetOpts.FloatABIType = llvm::FloatABI::Hard;
+    }
+  }
+#endif
+#else
+  LLVM_SET_TARGET_MACHINE_OPTIONS(TargetOpts);
+#endif
+#endif
+
   // Binutils does not yet support the use of file directives with an explicit
   // directory.  FIXME: Once GCC learns to detect support for this, condition
   // on what GCC detected.
-  Options.MCOptions.MCUseDwarfDirectory = false;
+#if LLVM_VERSION_CODE > LLVM_VERSION(3, 3)
+  TargetOpts.MCOptions.MCUseDwarfDirectory = false;
+#endif
 
-  TheTarget = TME->createTargetMachine(TargetTriple, CPU, FeatureStr, Options,
-                                       RelocModel, CMModel, CodeGenOptLevel());
-  assert(TheTarget->getSubtargetImpl()->getDataLayout()->isBigEndian() ==
-         BYTES_BIG_ENDIAN);
+#ifdef DRAGONEGG_DEBUG
+  printf("DEBUG: %s, line %d: %s: triple: %s cpu: %s feature: %s\n", __FILE__,
+          __LINE__, __func__, TargetTriple.c_str(), CPU.c_str(),
+          FeatureStr.c_str());
+#endif
+  TheTarget = TME->createTargetMachine(TargetTriple, CPU, FeatureStr,
+                                       TargetOpts, RelocModel, CMModel,
+                                       CodeGenOptLevel());
+
+#if LLVM_VERSION_CODE > LLVM_VERSION(3, 8)
+  assert(TheModule->getDataLayout()->isBigEndian() == BYTES_BIG_ENDIAN);
+#else
+  assert(TheTarget->getSubtargetImpl()->getDataLayout()->isBigEndian() == BYTES_BIG_ENDIAN);
+#endif
 }
 
 /// output_ident - Insert a .ident directive that identifies the plugin.
 static void output_ident(const char *ident_str) {
   const char *ident_asm_op = "\t.ident\t";
-#if (GCC_MINOR < 8)
+#if GCC_VERSION_CODE < GCC_VERSION(4, 8)
 #ifdef IDENT_ASM_OP
   ident_asm_op = IDENT_ASM_OP;
 #endif
@@ -550,18 +704,18 @@ static void output_ident(const char *ident_str) {
   Directive += "\"";
   Directive += ident_str;
   Directive += " LLVM: ";
-  Directive += LLVM_VERSION;
+  Directive += LLVM_VERSION_STRING;
   Directive += "\"";
+#ifdef DRAGONEGG_DEBUG
+  printf("DEBUG: %s, line %d: %s: %s\n", __FILE__, __LINE__, __func__,
+          Directive.c_str());
+#endif
   TheModule->setModuleInlineAsm(Directive);
 }
 
 /// CreateModule - Create and initialize a module to output LLVM IR to.
 static void CreateModule(const std::string &TargetTriple) {
-  // Create the module itself.
-  StringRef ModuleID = main_input_filename ? main_input_filename : "";
-  TheModule = new Module(ModuleID, getGlobalContext());
-
-#if (GCC_MINOR < 8)
+#if GCC_VERSION_CODE < GCC_VERSION(4, 8)
 #ifdef IDENT_ASM_OP
   if (!flag_no_ident) {
     std::string IdentString;
@@ -583,9 +737,26 @@ static void CreateModule(const std::string &TargetTriple) {
   // Install information about the target triple and data layout into the module
   // for optimizer use.
   TheModule->setTargetTriple(TargetTriple);
+  // https://reviews.llvm.org/D11103
+#if LLVM_VERSION_CODE > LLVM_VERSION(3, 8)
+  auto &DL = TheTarget->createDataLayout();
+#ifdef DRAGONEGG_DEBUG
+  printf("DEBUG: %s, line %d: %s: %s\n", __FILE__, __LINE__, __func__,
+          DL.getStringRepresentation().c_str());
+#endif
+  TheModule->setDataLayout(DL);
+#elif LLVM_VERSION_CODE > LLVM_VERSION(3, 3)
   TheModule->setDataLayout(TheTarget->getSubtargetImpl()
                                ->getDataLayout()
                                ->getStringRepresentation());
+#else
+#ifdef DRAGONEGG_DEBUG
+  printf("DEBUG: %s, line %d: %s: %s\n", __FILE__, __LINE__, __func__,
+          TheTarget->getDataLayout()->getStringRepresentation().c_str());
+#endif
+  TheModule->setDataLayout(
+      TheTarget->getDataLayout()->getStringRepresentation());
+#endif
 }
 
 /// flag_default_initialize_globals - Whether global variables with no explicit
@@ -641,12 +812,22 @@ static void InitializeBackend(void) {
 
   // Create the target machine to generate code for.
   const std::string TargetTriple = ComputeTargetTriple();
+#ifdef DRAGONEGG_DEBUG
+  printf("DEBUG: %s, line %d: %s: %s\n", __FILE__, __LINE__, __func__,
+          TargetTriple.c_str());
+#endif
   CreateTargetMachine(TargetTriple);
 
   // Create a module to hold the generated LLVM IR.
   CreateModule(TargetTriple);
 
+#if LLVM_VERSION_CODE > LLVM_VERSION(3, 8)
+  TheFolder = new TargetFolder(TheModule->getDataLayout());
+#elif LLVM_VERSION_CODE > LLVM_VERSION(3, 3)
   TheFolder = new TargetFolder(TheTarget->getSubtargetImpl()->getDataLayout());
+#else
+  TheFolder = new TargetFolder(TheTarget->getDataLayout());
+#endif
 
   if (debug_info_level > DINFO_LEVEL_NONE) {
     TheDebugInfo = new DebugInfo(TheModule);
@@ -660,14 +841,31 @@ static void InitializeBackend(void) {
   PassBuilder.SizeLevel = optimize_size;
   PassBuilder.DisableUnitAtATime = !flag_unit_at_a_time;
   PassBuilder.DisableUnrollLoops = !flag_unroll_loops;
-//  Don't turn on the SLP vectorizer by default at -O3 for the moment.
-//  PassBuilder.SLPVectorize = flag_tree_slp_vectorize;
-  PassBuilder.LoopVectorize = flag_tree_vectorize;
+  // Don't turn on the SLP vectorizer by default at -O3 for the moment.
+#if (GCC_MAJOR > 4)
+  PassBuilder.SLPVectorize = flag_tree_slp_vectorize;
+#endif
+  PassBuilder.LoopVectorize =
+#if (GCC_MAJOR > 7)
+      flag_tree_loop_vectorize;
+#else
+      flag_tree_vectorize;
+#endif
 
-  PassBuilder.LibraryInfo =
-      new TargetLibraryInfo((Triple) TheModule->getTargetTriple());
-  if (flag_no_simplify_libcalls)
+#if LLVM_VERSION_CODE > LLVM_VERSION(3, 8)
+  PassBuilder.MergeFunctions = false;
+  PassBuilder.RerollLoops = false;
+  PassBuilder.LibraryInfo = new TargetLibraryInfoImpl(Triple(TargetTriple));
+#else
+  PassBuilder.LibraryInfo = new TargetLibraryInfo(Triple(TargetTriple));
+#endif
+  if (flag_no_simplify_libcalls) {
+#ifdef DRAGONEGG_DEBUG
+    printf("DEBUG: %s, line %d: %s: disable all library functions.\n",
+            __FILE__, __LINE__, __func__);
+#endif
     PassBuilder.LibraryInfo->disableAllFunctions();
+  }
 
   Initialized = true;
 }
@@ -675,16 +873,39 @@ static void InitializeBackend(void) {
 /// InitializeOutputStreams - Initialize the assembly code output streams.
 static void InitializeOutputStreams(bool Binary) {
   assert(!OutStream && "Output stream already initialized!");
+#if LLVM_VERSION_CODE > LLVM_VERSION(3, 3)
   std::error_code EC;
 
-  OutStream = new raw_fd_ostream(llvm_asm_file_name, EC,
-                                 Binary ? sys::fs::F_None : sys::fs::F_Text);
+  OutStream.reset(new raw_fd_ostream(
+              llvm_asm_file_name, EC,
+              Binary ? sys::fs::F_None : sys::fs::F_Text));
 
   if (EC)
     report_fatal_error(EC.message());
+#else
+  std::string Error;
 
+  OutStream = new raw_fd_ostream(llvm_asm_file_name, Error,
+                                 Binary ? raw_fd_ostream::F_Binary : 0);
+
+  if (!Error.empty())
+    report_fatal_error(Error);
+#endif
+
+  // https://reviews.llvm.org/rL234535
+#if LLVM_VERSION_CODE > LLVM_VERSION(3, 3)
+  if (!Binary || OutStream->supportsSeeking()) {
+    FormattedOutStream = std::move(OutStream);
+  } else {
+    auto B = llvm::make_unique<llvm::buffer_ostream>(*OutStream);
+    FormattedOutStream = std::move(B);
+  }
+  if (!FormattedOutStream)
+    report_fatal_error("ERROR: failed to format output stream!");
+#else
   FormattedOutStream.setStream(*OutStream,
                                formatted_raw_ostream::PRESERVE_STREAM);
+#endif
 }
 
 static void createPerFunctionOptimizationPasses() {
@@ -693,15 +914,31 @@ static void createPerFunctionOptimizationPasses() {
 
   // Create and set up the per-function pass manager.
   // FIXME: Move the code generator to be function-at-a-time.
+#if LLVM_VERSION_CODE > LLVM_VERSION(3, 8)
+  PerFunctionPasses = new legacy::FunctionPassManager(TheModule);
+#else
   PerFunctionPasses = new FunctionPassManager(TheModule);
+#endif
+  // https://reviews.llvm.org/D7992
+#if LLVM_VERSION_CODE > LLVM_VERSION(3, 8)
+  PerFunctionPasses->add(
+        createTargetTransformInfoWrapperPass(TheTarget->getTargetIRAnalysis()));
+#elif LLVM_VERSION_CODE > LLVM_VERSION(3, 3)
   PerFunctionPasses->add(new DataLayoutPass());
+#else
+  PerFunctionPasses->add(new DataLayout(TheModule));
+#endif
+#if LLVM_VERSION_CODE > LLVM_VERSION(3, 3) && LLVM_VERSION_CODE < LLVM_VERSION(3, 7)
   TheTarget->addAnalysisPasses(*PerFunctionPasses);
+#endif
 
 #ifndef NDEBUG
   PerFunctionPasses->add(createVerifierPass());
 #endif
 
+#if LLVM_VERSION_CODE < LLVM_VERSION(3, 9)
   PassBuilder.OptLevel = PerFunctionOptLevel();
+#endif
   PassBuilder.populateFunctionPassManager(*PerFunctionPasses);
 
   // If there are no module-level passes that have to be run, we codegen as
@@ -711,7 +948,11 @@ static void createPerFunctionOptimizationPasses() {
   // FIXME: This is disabled right now until bugs can be worked out.  Reenable
   // this for fast -O0 compiles!
   if (!EmitIR && 0) {
+#if LLVM_VERSION_CODE > LLVM_VERSION(3, 8)
+    legacy::FunctionPassManager *PM = PerFunctionPasses;
+#else
     FunctionPassManager *PM = PerFunctionPasses;
+#endif
 
 // Request that addPassesToEmitFile run the Verifier after running
 // passes which modify the IR.
@@ -727,21 +968,42 @@ static void createPerFunctionOptimizationPasses() {
     TargetMachine::CodeGenFileType CGFT = TargetMachine::CGFT_AssemblyFile;
     if (EmitObj)
       CGFT = TargetMachine::CGFT_ObjectFile;
-    if (TheTarget->addPassesToEmitFile(*PM, FormattedOutStream, CGFT,
+    if (TheTarget->addPassesToEmitFile(*PM,
+#if LLVM_VERSION_CODE > LLVM_VERSION(3, 3)
+                                       *FormattedOutStream,
+#else
+                                       FormattedOutStream,
+#endif
+                                       CGFT,
                                        DisableVerify))
       llvm_unreachable("Error interfacing to target machine!");
   }
 
+#if LLVM_VERSION_CODE < LLVM_VERSION(3, 9)
   PerFunctionPasses->doInitialization();
+#endif
 }
 
 static void createPerModuleOptimizationPasses() {
   if (PerModulePasses)
     return;
 
+#if LLVM_VERSION_CODE > LLVM_VERSION(3, 8)
+  PerModulePasses = new legacy::PassManager();
+#else
   PerModulePasses = new PassManager();
+#endif
+#if LLVM_VERSION_CODE > LLVM_VERSION(3, 8)
+  PerModulePasses->add(
+        createTargetTransformInfoWrapperPass(TheTarget->getTargetIRAnalysis()));
+#elif LLVM_VERSION_CODE > LLVM_VERSION(3, 3)
   PerModulePasses->add(new DataLayoutPass());
+#else
+  PerModulePasses->add(new DataLayout(TheModule));
+#endif
+#if LLVM_VERSION_CODE >= LLVM_VERSION(3, 3) && LLVM_VERSION_CODE <= LLVM_VERSION(3, 6)
   TheTarget->addAnalysisPasses(*PerModulePasses);
+#endif
 
   Pass *InliningPass;
   if (!LLVMIROptimizeArg)
@@ -763,7 +1025,11 @@ static void createPerModuleOptimizationPasses() {
   } else {
     // Run the always-inline pass to handle functions marked as always_inline.
     // TODO: Consider letting the GCC inliner do this.
+#if LLVM_VERSION_CODE > LLVM_VERSION(3, 9)
+    InliningPass = createAlwaysInlinerLegacyPass();
+#else
     InliningPass = createAlwaysInlinerPass();
+#endif
   }
 
   PassBuilder.OptLevel = ModuleOptLevel();
@@ -774,7 +1040,13 @@ static void createPerModuleOptimizationPasses() {
     // Emit an LLVM .ll file to the output.  This is used when passed
     // -emit-llvm -S to the GCC driver.
     InitializeOutputStreams(false);
-    PerModulePasses->add(createPrintModulePass(*OutStream));
+    PerModulePasses->add(createPrintModulePass(
+#if LLVM_VERSION_CODE > LLVM_VERSION(3, 3)
+                *FormattedOutStream
+#else
+                OutStream
+#endif
+                ));
   } else {
     // If there are passes we have to run on the entire module, we do codegen
     // as a separate "pass" after that happens.
@@ -783,9 +1055,23 @@ static void createPerModuleOptimizationPasses() {
     // FIXME: This is disabled right now until bugs can be worked out.  Reenable
     // this for fast -O0 compiles!
     if (PerModulePasses || 1) {
-      PassManager *PM = CodeGenPasses = new PassManager();
-      PM->add(new DataLayoutPass());
+#if LLVM_VERSION_CODE > LLVM_VERSION(3, 8)
+#if LLVM_VERSION_MAJOR > 4
+      TheTarget->adjustPassManager(PassBuilder);
+#endif
+      CodeGenPasses = new legacy::PassManager();
+      CodeGenPasses->add(
+        createTargetTransformInfoWrapperPass(TheTarget->getTargetIRAnalysis()));
+      TargetLibraryInfoImpl TLII(Triple(TheModule->getTargetTriple()));
+      CodeGenPasses->add(new TargetLibraryInfoWrapperPass(TLII));
+#else
+      FunctionPassManager *PM = CodeGenPasses =
+          new FunctionPassManager(TheModule);
+      PM->add(new DataLayout(*TheTarget->getDataLayout()));
+#endif
+#if LLVM_VERSION_CODE >= LLVM_VERSION(3, 3) && LLVM_VERSION_CODE <= LLVM_VERSION(3, 6)
       TheTarget->addAnalysisPasses(*PM);
+#endif
 
 // Request that addPassesToEmitFile run the Verifier after running
 // passes which modify the IR.
@@ -801,7 +1087,13 @@ static void createPerModuleOptimizationPasses() {
       TargetMachine::CodeGenFileType CGFT = TargetMachine::CGFT_AssemblyFile;
       if (EmitObj)
         CGFT = TargetMachine::CGFT_ObjectFile;
-      if (TheTarget->addPassesToEmitFile(*PM, FormattedOutStream, CGFT,
+      if (TheTarget->addPassesToEmitFile(
+#if LLVM_VERSION_CODE > LLVM_VERSION(3, 3)
+                                         *CodeGenPasses, *FormattedOutStream,
+#else
+                                         *PM, FormattedOutStream,
+#endif
+                                         CGFT,
                                          DisableVerify))
         llvm_unreachable("Error interfacing to target machine!");
     }
@@ -816,7 +1108,12 @@ static void CreateStructorsList(std::vector<std::pair<Constant *, int> > &Tors,
   std::vector<Constant *> StructInit;
   StructInit.resize(2);
 
-  LLVMContext &Context = getGlobalContext();
+  LLVMContext &Context =
+#if LLVM_VERSION_CODE > LLVM_VERSION(3, 8)
+      TheModule->getContext();
+#else
+      TheContext;
+#endif
 
   Type *FPTy =
       FunctionType::get(Type::getVoidTy(Context), std::vector<Type *>(), false);
@@ -840,7 +1137,13 @@ static void CreateStructorsList(std::vector<std::pair<Constant *, int> > &Tors,
 /// global if possible.
 Constant *ConvertMetadataStringToGV(const char *str) {
 
-  Constant *Init = ConstantDataArray::getString(getGlobalContext(), str);
+  LLVMContext &Context =
+#if LLVM_VERSION_CODE > LLVM_VERSION(3, 8)
+      TheModule->getContext();
+#else
+      TheContext;
+#endif
+  Constant *Init = ConstantDataArray::getString(Context, str);
 
   // Use cached string if it exists.
   static std::map<Constant *, GlobalVariable *> StringCSTCache;
@@ -861,7 +1164,12 @@ Constant *ConvertMetadataStringToGV(const char *str) {
 /// AddAnnotateAttrsToGlobal - Adds decls that have a annotate attribute to a
 /// vector to be emitted later.
 void AddAnnotateAttrsToGlobal(GlobalValue *GV, tree decl) {
-  LLVMContext &Context = getGlobalContext();
+  LLVMContext &Context =
+#if LLVM_VERSION_CODE > LLVM_VERSION(3, 8)
+      TheModule->getContext();
+#else
+      TheContext;
+#endif
 
   // Handle annotate attribute on global.
   tree annotateAttr = lookup_attribute("annotate", DECL_ATTRIBUTES(decl));
@@ -935,6 +1243,9 @@ static GlobalValue::LinkageTypes GetLinkageForAlias(tree decl) {
 
 /// emit_alias - Given decl and target emit alias to target.
 static void emit_alias(tree decl, tree target) {
+#ifdef DRAGONEGG_DEBUG
+  printf("DEBUG: %s, line %d: %s\n", __FILE__, __LINE__, __func__);
+#endif
   if (errorcount || sorrycount)
     return; // Do not process broken code.
 
@@ -945,9 +1256,17 @@ static void emit_alias(tree decl, tree target) {
     target = TREE_CHAIN(target);
 
   if (isa<IDENTIFIER_NODE>(target)) {
+#if (GCC_MAJOR > 4)
+    if (struct cgraph_node *fnode = cgraph_node::get_for_asmname(target))
+#else
     if (struct cgraph_node *fnode = cgraph_node_for_asm(target))
+#endif
       target = cgraph_symbol(fnode)->decl;
+#if (GCC_MAJOR > 4)
+    else if (struct varpool_node *vnode = varpool_node::get_for_asmname(target))
+#else
     else if (struct varpool_node *vnode = varpool_node_for_asm(target))
+#endif
       target = varpool_symbol(vnode)->decl;
   }
 
@@ -988,8 +1307,13 @@ static void emit_alias(tree decl, tree target) {
     auto *GV = cast<GlobalValue>(Aliasee->stripPointerCasts());
     if (auto *GA = llvm::dyn_cast<GlobalAlias>(GV))
       GV = cast<GlobalValue>(GA->getAliasee()->stripPointerCasts());
+#if LLVM_VERSION_CODE > LLVM_VERSION(3, 3)
     auto *GA = GlobalAlias::create(Aliasee->getType()->getElementType(), 0,
                                    Linkage, "", GV);
+#else
+    GlobalAlias *GA =
+        new GlobalAlias(Aliasee->getType(), Linkage, "", Aliasee, TheModule);
+#endif
     handleVisibility(decl, GA);
 
     // Associate it with decl instead of V.
@@ -1011,14 +1335,18 @@ static void emit_alias(tree decl, tree target) {
 /// emit_varpool_aliases - Output any aliases associated with the given varpool
 /// node.
 static void emit_varpool_aliases(struct varpool_node *node) {
-#if (GCC_MINOR < 7)
+#if GCC_VERSION_CODE < GCC_VERSION(4, 7)
   for (struct varpool_node *alias = node->extra_name; alias;
        alias = alias->next)
     emit_alias(alias->decl, node->decl);
 #else
   struct ipa_ref *ref;
-  for (int i = 0;
+  for (unsigned int i = 0;
+#if (GCC_MAJOR > 4)
+       node->iterate_direct_aliases(i, ref);
+#else
        ipa_ref_list_referring_iterate(&varpool_symbol(node)->ref_list, i, ref);
+#endif
        i++) {
     if (ref->use != IPA_REF_ALIAS)
       continue;
@@ -1026,7 +1354,13 @@ static void emit_varpool_aliases(struct varpool_node *node) {
     if (lookup_attribute("weakref",
                          DECL_ATTRIBUTES(varpool_symbol(alias)->decl)))
       continue;
-    emit_alias(varpool_symbol(alias)->decl, alias->alias_of);
+    emit_alias(varpool_symbol(alias)->decl,
+#if (GCC_MAJOR > 4)
+               alias->get_constructor()
+#else
+               alias->alias_of
+#endif
+              );
     emit_varpool_aliases(alias);
   }
 #endif
@@ -1035,6 +1369,9 @@ static void emit_varpool_aliases(struct varpool_node *node) {
 /// emit_global - Emit the specified VAR_DECL or aggregate CONST_DECL to LLVM as
 /// a global variable.  This function implements the end of assemble_variable.
 static void emit_global(tree decl) {
+#ifdef DRAGONEGG_DEBUG
+  printf("DEBUG: %s, line %d: %s\n", __FILE__, __LINE__, __func__);
+#endif
   // FIXME: DECL_PRESERVE_P indicates the var is marked with attribute 'used'.
 
   // Global register variables don't turn into LLVM GlobalVariables.
@@ -1136,14 +1473,23 @@ static void emit_global(tree decl) {
   // is not taken).  However if -fmerge-all-constants was specified then allow
   // merging even if the address was taken.  Note that merging will only happen
   // if the global is constant or later proved to be constant by the optimizers.
-  GV->setUnnamedAddr(flag_merge_constants >= 2 || !TREE_ADDRESSABLE(decl));
+  GV->setUnnamedAddr(flag_merge_constants >= 2 || !TREE_ADDRESSABLE(decl)
+#if LLVM_VERSION_CODE > LLVM_VERSION(3, 8)
+          ? llvm::GlobalValue::UnnamedAddr::Global
+          : llvm::GlobalValue::UnnamedAddr::Local
+#endif
+          );
 
   handleVisibility(decl, GV);
 
   // Set the section for the global.
   if (isa<VAR_DECL>(decl)) {
     if (DECL_SECTION_NAME(decl)) {
-      GV->setSection(TREE_STRING_POINTER(DECL_SECTION_NAME(decl)));
+#if (GCC_MAJOR > 4)
+      GV->setSection(StringRef(DECL_SECTION_NAME(decl)));
+#else
+      GV->setSection(StringRef(TREE_STRING_POINTER(DECL_SECTION_NAME(decl))));
+#endif
 #ifdef LLVM_IMPLICIT_TARGET_GLOBAL_VAR_SECTION
     } else if (const char *Section =
                    LLVM_IMPLICIT_TARGET_GLOBAL_VAR_SECTION(decl)) {
@@ -1200,15 +1546,17 @@ static void emit_global(tree decl) {
   assert(SizeOfGlobalMatchesDecl(GV, decl) && "Global has wrong size!");
 
   // Mark the global as written so gcc doesn't waste time outputting it.
-#if (GCC_MINOR < 8)
+#if GCC_VERSION_CODE < GCC_VERSION(4, 8)
   TREE_ASM_WRITTEN(decl) = 1;
 #endif
 
   // Output any associated aliases.
   if (isa<VAR_DECL>(decl))
     if (struct varpool_node *vnode =
-#if (GCC_MINOR < 6)
-            varpool_node(decl)
+#if GCC_VERSION_CODE < GCC_VERSION(4, 6)
+        varpool_node(decl)
+#elif (GCC_MAJOR > 4)
+        varpool_node::get(decl)
 #else
         varpool_get_node(decl)
 #endif
@@ -1283,7 +1631,12 @@ Value *make_decl_llvm(tree decl) {
   if (errorcount || sorrycount)
     return NULL; // Do not process broken code.
 
-  LLVMContext &Context = getGlobalContext();
+  LLVMContext &Context =
+#if LLVM_VERSION_CODE > LLVM_VERSION(3, 8)
+      TheModule->getContext();
+#else
+      TheContext;
+#endif
 
   // Global register variable with asm name, e.g.:
   // register unsigned long esp __asm__("ebp");
@@ -1315,7 +1668,11 @@ Value *make_decl_llvm(tree decl) {
 
   // Specifying a section attribute on a variable forces it into a
   // non-.bss section, and thus it cannot be common.
+#if (GCC_MAJOR > 4)
+  if (isa<VAR_DECL>(decl) && DECL_SECTION_NAME(decl) != NULL &&
+#else
   if (isa<VAR_DECL>(decl) && DECL_SECTION_NAME(decl) != NULL_TREE &&
+#endif
       DECL_INITIAL(decl) == NULL_TREE && DECL_COMMON(decl))
     DECL_COMMON(decl) = 0;
 
@@ -1333,7 +1690,7 @@ Value *make_decl_llvm(tree decl) {
     Function *FnEntry = TheModule->getFunction(Name);
     if (FnEntry == 0) {
       CallingConv::ID CC;
-      AttributeSet PAL;
+      MigAttributeSet PAL;
       FunctionType *Ty =
           ConvertFunctionType(TREE_TYPE(decl), decl, NULL, CC, PAL);
       FnEntry =
@@ -1583,6 +1940,10 @@ static void TakeoverAsmOutput(void) {
     memcpy(name, llvm_asm_file_name, len + 1);
     asm_file_name = strcat(name, ".gcc");
   }
+#ifdef DRAGONEGG_DEBUG
+  printf("DEBUG: %s, line %d: %s: llvm_asm_file_name %s, asm_file_name %s\n",
+          __FILE__, __LINE__, __func__, llvm_asm_file_name, asm_file_name);
+#endif
 }
 
 /// no_target_thunks - Hook for can_output_mi_thunk that always says "no".
@@ -1605,6 +1966,9 @@ int plugin_is_GPL_compatible __attribute__((visibility("default")));
 /// NOTE: called even when only doing syntax checking, so do not initialize the
 /// module etc here.
 static void llvm_start_unit(void */*gcc_data*/, void */*user_data*/) {
+#ifdef DRAGONEGG_DEBUG
+  printf("DEBUG: %s, line %d: %s\n", __FILE__, __LINE__, __func__);
+#endif
   if (!quiet_flag)
     errs() << "Starting compilation unit\n";
 
@@ -1612,11 +1976,13 @@ static void llvm_start_unit(void */*gcc_data*/, void */*user_data*/) {
   // Output LLVM IR if the user requested generation of lto data.
   EmitIR |= flag_generate_lto != 0;
   // We have the same needs as GCC's LTO.  Always claim to be doing LTO.
+#if (GCC_MAJOR < 5)
   flag_lto =
-#if (GCC_MINOR > 5)
+#if GCC_VERSION_CODE > GCC_VERSION(4, 5)
       "";
 #else
   1;
+#endif
 #endif
   flag_generate_lto = 1;
   flag_whole_program = 0;
@@ -1636,7 +2002,7 @@ static void llvm_start_unit(void */*gcc_data*/, void */*user_data*/) {
   // LLVM codegen takes care of this, and we don't want them decorated twice.
   targetm.mangle_decl_assembler_name = default_mangle_decl_assembler_name;
 
-#if (GCC_MINOR > 7)
+#if GCC_VERSION_CODE > GCC_VERSION(4, 7)
   // Arrange for a special .ident directive identifying the compiler and plugin
   // versions to be inserted into the final assembler.
   targetm.asm_out.output_ident = output_ident;
@@ -1646,7 +2012,7 @@ static void llvm_start_unit(void */*gcc_data*/, void */*user_data*/) {
 /// emit_cgraph_aliases - Output any aliases associated with the given cgraph
 /// node.
 static void emit_cgraph_aliases(struct cgraph_node *node) {
-#if (GCC_MINOR < 7)
+#if GCC_VERSION_CODE < GCC_VERSION(4, 7)
   struct cgraph_node *alias, *next;
   for (alias = node->same_body; alias && alias->next; alias = alias->next)
     ;
@@ -1660,8 +2026,12 @@ static void emit_cgraph_aliases(struct cgraph_node *node) {
   // for thunks to be output as functions and thus visit thunk aliases when the
   // thunk function is output.
   struct ipa_ref *ref;
-  for (int i = 0;
+  for (unsigned int i = 0;
+#if (GCC_MAJOR > 4)
+       node->iterate_direct_aliases(i, ref);
+#else
        ipa_ref_list_referring_iterate(&cgraph_symbol(node)->ref_list, i, ref);
+#endif
        i++) {
     if (ref->use != IPA_REF_ALIAS)
       continue;
@@ -1689,13 +2059,24 @@ static void emit_current_function() {
   }
 
   // Output any associated aliases.
+#if (GCC_MAJOR > 4)
+  emit_cgraph_aliases(cgraph_node::get(current_function_decl));
+#else
   emit_cgraph_aliases(cgraph_get_node(current_function_decl));
+#endif
 
   if (!errorcount && !sorrycount) { // Do not process broken code.
     createPerFunctionOptimizationPasses();
 
-    if (PerFunctionPasses)
+    if (PerFunctionPasses) {
+#ifdef DRAGONEGG_DEBUG
+      printf("DEBUG: %s, line %d: %s: %s\n", __FILE__, __LINE__, __func__,
+              Fn->getName().str().c_str());
+#endif
+#if LLVM_VERSION_CODE < LLVM_VERSION(3, 9)
       PerFunctionPasses->run(*Fn);
+#endif
+    }
 
     // TODO: Nuke the .ll code for the function at -O[01] if we don't want to
     // inline it or something else.
@@ -1713,13 +2094,17 @@ static unsigned int rtl_emit_function(void) {
   }
 
   // Free tree-ssa data structures.
-#if (GCC_MINOR < 8)
+#if GCC_VERSION_CODE < GCC_VERSION(4, 8)
   execute_free_datastructures();
 #else
   free_dominance_info(CDI_DOMINATORS);
   free_dominance_info(CDI_POST_DOMINATORS);
   // And get rid of annotations we no longer need.
+#if (GCC_MAJOR > 4)
+  delete_tree_cfg_annotations(DECL_STRUCT_FUNCTION(current_function_decl));
+#else
   delete_tree_cfg_annotations();
+#endif
 #endif
 
   // Finally, we have written out this function!
@@ -1728,6 +2113,7 @@ static unsigned int rtl_emit_function(void) {
 }
 
 /// pass_rtl_emit_function - RTL pass that converts a function to LLVM IR.
+#if (GCC_MAJOR < 5)
 static struct rtl_opt_pass pass_rtl_emit_function = { {
   RTL_PASS, "rtl_emit_function",         /* name */
 #if (GCC_MINOR >= 8)
@@ -1742,11 +2128,47 @@ static struct rtl_opt_pass pass_rtl_emit_function = { {
   PROP_ssa | PROP_gimple_leh | PROP_cfg, /* properties_required */
   0,                                     /* properties_provided */
   PROP_ssa | PROP_trees,                 /* properties_destroyed */
-  TODO_verify_ssa | TODO_verify_flow | TODO_verify_stmts
+  TODO_verify_ssa | TODO_verify_flow | TODO_verify_stmts, /* todo_flags_start */
+  TODO_ggc_collect /* todo_flags_finish */
 } };
+#else
+const pass_data pass_data_rtl_emit_function = {
+  RTL_PASS,                              /* type */
+  "rtl_emit_function",                   /* name */
+  OPTGROUP_NONE,                         /* optinfo_flags */
+  TV_NONE,                               /* tv_id */
+  PROP_ssa | PROP_gimple_leh | PROP_cfg, /* properties_required */
+  0,                                     /* properties_provided */
+  PROP_ssa | PROP_trees,                 /* properties_destroyed */
+  0,                                     /* todo_flags_start */
+  0,                                     /* todo_flags_finish */
+};
+
+class pass_rtl_emit_function : public rtl_opt_pass {
+public:
+  pass_rtl_emit_function(gcc::context *ctxt)
+      : rtl_opt_pass(pass_data_rtl_emit_function, ctxt) {
+  }
+
+  opt_pass *clone() final override {
+    return this;
+  }
+
+  bool gate(function *) final override {
+    return true;
+  }
+
+  unsigned int execute(function *) final override {
+    return rtl_emit_function();
+  }
+};
+#endif
 
 /// emit_file_scope_asms - Output any file-scope assembly.
 static void emit_file_scope_asms() {
+#ifdef DRAGONEGG_DEBUG
+  printf("DEBUG: %s, line %d: %s\n", __FILE__, __LINE__, __func__);
+#endif
   for (struct asm_node *anode = asm_nodes; anode; anode = anode->next) {
     tree string = anode->asm_str;
     if (isa<ADDR_EXPR>(string))
@@ -1754,10 +2176,12 @@ static void emit_file_scope_asms() {
     TheModule->appendModuleInlineAsm(TREE_STRING_POINTER(string));
   }
   // Remove the asms so gcc doesn't waste time outputting them.
+#if (GCC_MAJOR < 5)
   asm_nodes = NULL;
+#endif
 }
 
-#if (GCC_MINOR > 6)
+#if GCC_VERSION_CODE > GCC_VERSION(4, 6)
 /// get_alias_symbol - Return the name of the aliasee for this alias.
 static tree get_alias_symbol(tree decl) {
   tree alias = lookup_attribute("alias", DECL_ATTRIBUTES(decl));
@@ -1767,6 +2191,9 @@ static tree get_alias_symbol(tree decl) {
 /// emit_cgraph_weakrefs - Output any cgraph weak references to external
 /// declarations.
 static void emit_cgraph_weakrefs() {
+#ifdef DRAGONEGG_DEBUG
+  printf("DEBUG: %s, line %d: %s\n", __FILE__, __LINE__, __func__);
+#endif
   struct cgraph_node *node;
   FOR_EACH_FUNCTION(node)
     if (node->alias && DECL_EXTERNAL(cgraph_symbol(node)->decl) &&
@@ -1779,23 +2206,34 @@ static void emit_cgraph_weakrefs() {
 /// emit_varpool_weakrefs - Output any varpool weak references to external
 /// declarations.
 static void emit_varpool_weakrefs() {
+#ifdef DRAGONEGG_DEBUG
+  printf("DEBUG: %s, line %d: %s\n", __FILE__, __LINE__, __func__);
+#endif
   struct varpool_node *vnode;
   FOR_EACH_VARIABLE(vnode)
     if (vnode->alias && DECL_EXTERNAL(varpool_symbol(vnode)->decl) &&
         lookup_attribute("weakref",
                          DECL_ATTRIBUTES(varpool_symbol(vnode)->decl)))
-      emit_alias(varpool_symbol(vnode)->decl, vnode->alias_of ? vnode->alias_of
+      emit_alias(varpool_symbol(vnode)->decl,
+#if (GCC_MAJOR > 4)
+                 vnode->get_constructor() ? vnode->get_constructor()
+#else
+                 vnode->alias_of ? vnode->alias_of
+#endif
                  : get_alias_symbol(varpool_symbol(vnode)->decl));
 }
 #endif
 
-#if (GCC_MINOR < 8)
+#if GCC_VERSION_CODE < GCC_VERSION(4, 8)
 INSTANTIATE_VECTOR(alias_pair);
 #endif
 
 /// llvm_emit_globals - Output GCC global variables, aliases and asm's to the
 /// LLVM IR.
 static void llvm_emit_globals(void * /*gcc_data*/, void * /*user_data*/) {
+#ifdef DRAGONEGG_DEBUG
+  printf("DEBUG: %s, line %d: %s\n", __FILE__, __LINE__, __func__);
+#endif
   if (errorcount || sorrycount)
     return; // Do not process broken code.
 
@@ -1810,7 +2248,7 @@ static void llvm_emit_globals(void * /*gcc_data*/, void * /*user_data*/) {
   struct varpool_node *vnode;
   FOR_EACH_VARIABLE(vnode) {
     // If the node is explicitly marked as not being needed, then skip it.
-#if (GCC_MINOR < 8)
+#if GCC_VERSION_CODE < GCC_VERSION(4, 8)
     if (!vnode->needed)
       continue;
 #endif
@@ -1822,14 +2260,21 @@ static void llvm_emit_globals(void * /*gcc_data*/, void * /*user_data*/) {
     tree decl = varpool_symbol(vnode)->decl;
     if (vnode->analyzed &&
         (
-#if (GCC_MINOR > 5)
+#if GCC_VERSION_CODE > GCC_VERSION(4, 5)
+#if (GCC_MAJOR > 4)
+            !vnode->can_remove_if_no_refs_p() && !vnode->in_other_partition
+#else
             !varpool_can_remove_if_no_refs(vnode)
+#endif
 #else
             vnode->force_output ||
             (!DECL_COMDAT(decl) &&
              (!DECL_ARTIFICIAL(decl) || vnode->externally_visible))
 #endif
-            ))
+            )) {
+#ifdef DRAGONEGG_DEBUG
+      printf("DEBUG: %s, line %d: %s: vnode\n", __FILE__, __LINE__, __func__);
+#endif
       // TODO: Remove the check on the following lines.  It only exists to avoid
       // outputting block addresses when not compiling the function containing
       // the block.  We need to support outputting block addresses at odd times
@@ -1838,9 +2283,10 @@ static void llvm_emit_globals(void * /*gcc_data*/, void * /*user_data*/) {
           (TREE_PUBLIC(decl) || DECL_PRESERVE_P(decl) ||
            TREE_THIS_VOLATILE(decl)))
         emit_global(decl);
+    }
   }
 
-#if (GCC_MINOR > 6)
+#if GCC_VERSION_CODE > GCC_VERSION(4, 6)
   // Aliases of functions and global variables with bodies are output when the
   // body is.  Output any aliases (weak references) of globals without bodies,
   // i.e. external declarations, now.
@@ -1891,7 +2337,12 @@ static void llvm_finish_unit(void */*gcc_data*/, void */*user_data*/) {
     TheDebugInfo = 0;
   }
 
-  LLVMContext &Context = getGlobalContext();
+  LLVMContext &Context =
+#if LLVM_VERSION_CODE > LLVM_VERSION(3, 8)
+      TheModule->getContext();
+#else
+      TheContext;
+#endif
 
   createPerFunctionOptimizationPasses();
 
@@ -1964,12 +2415,26 @@ static void llvm_finish_unit(void */*gcc_data*/, void */*user_data*/) {
     AttributeAnnotateGlobals.clear();
   }
 
-  // Finish off the per-function pass.
-  if (PerFunctionPasses)
-    PerFunctionPasses->doFinalization();
-
   // Run module-level optimizers, if any are present.
   createPerModuleOptimizationPasses();
+
+  // Finish off the per-function pass.
+  if (PerFunctionPasses) {
+#if LLVM_VERSION_CODE > LLVM_VERSION(3, 8)
+    PerFunctionPasses->doInitialization();
+    for (Function &F : *TheModule) {
+      if (!F.isDeclaration()) {
+#ifdef DRAGONEGG_DEBUG
+        printf("DEBUG: %s, line %d: %s: Per-function optimization for %s\n",
+                __FILE__, __LINE__, __func__, F.getName().str().c_str());
+#endif
+        PerFunctionPasses->run(F);
+      }
+    }
+#endif
+    PerFunctionPasses->doFinalization();
+  }
+
   if (PerModulePasses)
     PerModulePasses->run(*TheModule);
 
@@ -1981,13 +2446,26 @@ static void llvm_finish_unit(void */*gcc_data*/, void */*user_data*/) {
     void *OldHandlerData = Context.getInlineAsmDiagnosticContext();
     Context.setInlineAsmDiagnosticHandler(InlineAsmDiagnosticHandler, 0);
 
+#if LLVM_VERSION_CODE > LLVM_VERSION(3, 8)
     CodeGenPasses->run(*TheModule);
+#else
+    CodeGenPasses->doInitialization();
+    for (Module::iterator I = TheModule->begin(), E = TheModule->end(); I != E;
+         ++I)
+      if (!I->isDeclaration())
+        CodeGenPasses->run(*I);
+    CodeGenPasses->doFinalization();
+#endif
 
     Context.setInlineAsmDiagnosticHandler(OldHandler, OldHandlerData);
   }
 
+#if LLVM_VERSION_CODE > LLVM_VERSION(3, 8)
+  FormattedOutStream->flush();
+#else
   FormattedOutStream.flush();
   OutStream->flush();
+#endif
   //TODO  timevar_pop(TV_LLVM_PERFILE);
 
   // We have finished - shutdown the plugin.  Doing this here ensures that timer
@@ -2004,6 +2482,7 @@ static void llvm_finish(void */*gcc_data*/, void */*user_data*/) {
 static bool gate_null(void) { return false; }
 
 /// pass_gimple_null - Gimple pass that does nothing.
+#if (GCC_MAJOR < 5)
 static struct gimple_opt_pass pass_gimple_null = { {
   GIMPLE_PASS, "*gimple_null", /* name */
 #if (GCC_MINOR >= 8)
@@ -2021,12 +2500,38 @@ static struct gimple_opt_pass pass_gimple_null = { {
   0,                           /* todo_flags_start */
   0                            /* todo_flags_finish */
 } };
+#else
+const pass_data pass_data_gimple_null = {
+  GIMPLE_PASS,    /* type */
+  "*gimple_null", /* name */
+  OPTGROUP_NONE,  /* optinfo_flags */
+  TV_NONE,        /* tv_id */
+  0,              /* properties_required */
+  0,              /* properties_provided */
+  0,              /* properties_destroyed */
+  0,              /* todo_flags_start */
+  0,              /* todo_flags_finish */
+};
+
+class pass_gimple_null : public gimple_opt_pass {
+public:
+  pass_gimple_null(gcc::context *ctxt)
+      : gimple_opt_pass(pass_data_gimple_null, ctxt) {}
+  opt_pass *clone() final override { return this;/*new pass_gimple_null(m_ctxt);*/ }
+  bool gate(function *) final override { return gate_null(); }
+};
+#endif
 
 /// execute_correct_state - Correct the cgraph state to ensure that newly
 /// inserted functions are processed before being converted to LLVM IR.
 static unsigned int execute_correct_state(void) {
+#if (GCC_MAJOR > 4)
+  if (symtab->state < IPA_SSA)
+    symtab->state = IPA_SSA;
+#else
   if (cgraph_state < CGRAPH_STATE_IPA_SSA)
     cgraph_state = CGRAPH_STATE_IPA_SSA;
+#endif
   return 0;
 }
 
@@ -2035,6 +2540,7 @@ static bool gate_correct_state(void) { return true; }
 
 /// pass_gimple_correct_state - Gimple pass that corrects the cgraph state so
 /// newly inserted functions are processed before being converted to LLVM IR.
+#if (GCC_MAJOR < 5)
 static struct gimple_opt_pass pass_gimple_correct_state = { {
   GIMPLE_PASS, "*gimple_correct_state", /* name */
 #if (GCC_MINOR >= 8)
@@ -2052,8 +2558,32 @@ static struct gimple_opt_pass pass_gimple_correct_state = { {
   0,                                    /* todo_flags_start */
   0                                     /* todo_flags_finish */
 } };
+#else
+const pass_data pass_data_gimple_correct_state = {
+  GIMPLE_PASS,
+  "*gimple_correct_state",
+  OPTGROUP_NONE,
+  TV_NONE,
+  0,
+  0,
+  0,
+  0,
+  0,
+};
+
+class pass_gimple_correct_state : public gimple_opt_pass {
+public:
+  pass_gimple_correct_state(gcc::context *ctxt)
+      : gimple_opt_pass(pass_data_gimple_correct_state, ctxt) {}
+
+  bool gate(function *) final override { return gate_correct_state(); }
+
+  unsigned int execute(function *) final override { return execute_correct_state(); }
+};
+#endif
 
 /// pass_ipa_null - IPA pass that does nothing.
+#if (GCC_MAJOR < 5)
 static struct ipa_opt_pass_d pass_ipa_null = {
   { IPA_PASS, "*ipa_null", /* name */
 #if (GCC_MINOR >= 8)
@@ -2085,8 +2615,40 @@ static struct ipa_opt_pass_d pass_ipa_null = {
   NULL,                    /* function_transform */
   NULL                     /* variable_transform */
 };
+#else
+const pass_data pass_data_ipa_null = {
+  IPA_PASS,      /* type */
+  "*ipa_null",   /* name */
+  OPTGROUP_NONE, /* optinfo_flags */
+  TV_NONE,       /* tv_id */
+  0,             /* properties_required */
+  0,             /* properties_provided */
+  0,             /* properties_destroyed */
+  0,             /* todo_flags_start */
+  0,             /* todo_flags_finish */
+};
+
+class pass_ipa_null : public ipa_opt_pass_d {
+public:
+  pass_ipa_null(gcc::context *ctxt)
+      : ipa_opt_pass_d(pass_data_ipa_null, ctxt,
+                       NULL, /* generate_summary */
+                       NULL, /* write_summary */
+                       NULL, /* read_summary */
+                       NULL, /* write_optimization_summary */
+                       NULL, /* read_optimization_summary */
+                       NULL, /* stmt_fixup */
+                       0,    /* function_transform_todo_flags_start */
+                       NULL, /* function_transform */
+                       NULL) /* variable_transform */
+    {}
+  opt_pass *clone() final override { return this;/*new pass_ipa_null(m_ctxt);*/ }
+  bool gate(function *) final override { return gate_null(); }
+};
+#endif
 
 /// pass_rtl_null - RTL pass that does nothing.
+#if (GCC_MAJOR < 5)
 static struct rtl_opt_pass pass_rtl_null = { { RTL_PASS, "*rtl_null", /* name */
 #if (GCC_MINOR >= 8)
                                                OPTGROUP_NONE,/* optinfo_flags */
@@ -2103,8 +2665,30 @@ static struct rtl_opt_pass pass_rtl_null = { { RTL_PASS, "*rtl_null", /* name */
                                                0, /* todo_flags_start */
                                                0  /* todo_flags_finish */
 } };
+#else
+const pass_data pass_data_rtl_null = {
+  RTL_PASS,      /* type */
+  "*rtl_null",   /* name */
+  OPTGROUP_NONE, /* optinfo_flags */
+  TV_NONE,       /* tv_id */
+  0,             /* properties_required */
+  0,             /* properties_provided */
+  0,             /* properties_destroyed */
+  0,             /* todo_flags_start */
+  0,             /* todo_flags_finish */
+};
+
+class pass_rtl_null : public rtl_opt_pass {
+public:
+  pass_rtl_null(gcc::context *ctxt) : rtl_opt_pass(pass_data_rtl_null, ctxt) {}
+
+  opt_pass *clone() final override { return this;/*new pass_rtl_null(m_ctxt);*/ }
+  bool gate(function *) final override { return gate_null(); }
+};
+#endif
 
 /// pass_simple_ipa_null - Simple IPA pass that does nothing.
+#if (GCC_MAJOR < 5)
 static struct simple_ipa_opt_pass pass_simple_ipa_null = { {
   SIMPLE_IPA_PASS, "*simple_ipa_null", /* name */
 #if (GCC_MINOR >= 8)
@@ -2122,9 +2706,34 @@ static struct simple_ipa_opt_pass pass_simple_ipa_null = { {
   0,                                   /* todo_flags_start */
   0                                    /* todo_flags_finish */
 } };
+#else
+const pass_data pass_data_simple_ipa_null = {
+  SIMPLE_IPA_PASS,    /* type */
+  "*simple_ipa_null", /* name */
+  OPTGROUP_NONE,      /* optinfo_flags */
+  TV_NONE,            /* tv_id */
+  0,                  /* properties_required */
+  0,                  /* properties_provided */
+  0,                  /* properties_destroyed */
+  0,                  /* todo_flags_start */
+  0,                  /* todo_flags_finish */
+};
+
+class pass_simple_ipa_null : public simple_ipa_opt_pass {
+public:
+  pass_simple_ipa_null(gcc::context *ctxt)
+      : simple_ipa_opt_pass(pass_data_simple_ipa_null, ctxt) {}
+  opt_pass *clone() final override { return this;/*new pass_simple_ipa_null(m_ctxt);*/ }
+  bool gate(function *) final override { return gate_null(); }
+};
+#endif
 
 // Garbage collector roots.
+#if (GCC_MAJOR > 4)
+extern const struct ggc_root_tab gt_ggc_r__gt_cache_inc[];
+#else
 extern const struct ggc_cache_tab gt_ggc_rc__gt_cache_h[];
+#endif
 
 /// PluginFlags - Flag arguments for the plugin.
 
@@ -2144,9 +2753,9 @@ static FlagDescriptor PluginFlags[] = {
 /// llvm_plugin_info - Information about this plugin.  Users can access this
 /// using "gcc --help -v".
 static struct plugin_info llvm_plugin_info = {
-  LLVM_VERSION, // version
-                // TODO provide something useful here
-  NULL          // help
+  LLVM_VERSION_STRING, // version
+                       // TODO provide something useful here
+  NULL                 // help
 };
 
 #ifndef DISABLE_VERSION_CHECK
@@ -2171,6 +2780,10 @@ int __attribute__((visibility("default"))) plugin_init(
   struct register_pass_info pass_info;
 
 #ifndef DISABLE_VERSION_CHECK
+#ifdef DRAGONEGG_DEBUG
+  printf("DEBUG: %s, line %d: %s: GCC %s\n", __FILE__, __LINE__, __func__,
+          version->basever);
+#endif
   // Check that the plugin is compatible with the running gcc.
   if (!version_check(version)) {
     errs() << "Incompatible plugin version\n";
@@ -2270,12 +2883,23 @@ int __attribute__((visibility("default"))) plugin_init(
   TakeoverAsmOutput();
 
   // Register our garbage collector roots.
+  // https://gcc.gnu.org/ml/gcc-patches/2014-11/msg02965.html
+#if (GCC_MAJOR > 4)
+  register_callback(plugin_name, PLUGIN_REGISTER_GGC_ROOTS, NULL,
+                    const_cast<ggc_root_tab *>(gt_ggc_r__gt_cache_inc));
+#else
   register_callback(plugin_name, PLUGIN_REGISTER_GGC_CACHES, NULL,
                     const_cast<ggc_cache_tab *>(gt_ggc_rc__gt_cache_h));
+#endif
 
   // Perform late initialization just before processing the compilation unit.
   register_callback(plugin_name, PLUGIN_START_UNIT, llvm_start_unit, NULL);
 
+#ifdef DRAGONEGG_DEBUG
+  printf("DEBUG: %s, line %d: %s: %s\n", __FILE__, __LINE__, __func__,
+          EnableGCCOptimizations ? "Enable all gcc optimization passes." :
+          "Turn off all gcc optimization passes.");
+#endif
   // Turn off all gcc optimization passes.
   if (!EnableGCCOptimizations) {
 // TODO: figure out a good way of turning off ipa optimization passes.
@@ -2286,7 +2910,7 @@ int __attribute__((visibility("default"))) plugin_init(
 
 // Leave pass_ipa_function_and_variable_visibility.  Needed for correctness.
 
-#if (GCC_MINOR < 6)
+#if GCC_VERSION_CODE < GCC_VERSION(4, 6)
     // Turn off pass_ipa_early_inline.
     pass_info.pass = &pass_simple_ipa_null.pass;
     pass_info.reference_pass_name = "einline_ipa";
@@ -2306,7 +2930,12 @@ int __attribute__((visibility("default"))) plugin_init(
     // Leave pass_early_local_passes::pass_build_ssa.
 
     // Turn off pass_lower_vector.
-    pass_info.pass = &pass_gimple_null.pass;
+    pass_info.pass =
+#if (GCC_MAJOR < 5)
+        &pass_gimple_null.pass;
+#else
+        new pass_gimple_null(g);
+#endif
     pass_info.reference_pass_name = "veclower";
     pass_info.ref_pass_instance_number = 0;
     pass_info.pos_op = PASS_POS_REPLACE;
@@ -2325,14 +2954,24 @@ int __attribute__((visibility("default"))) plugin_init(
     // Insert a pass that ensures that any newly inserted functions, for example
     // those generated by OMP expansion, are processed before being converted to
     // LLVM IR.
-    pass_info.pass = &pass_gimple_correct_state.pass;
+    pass_info.pass =
+#if (GCC_MAJOR < 5)
+        &pass_gimple_correct_state.pass;
+#else
+        new pass_gimple_correct_state(g);
+#endif
     pass_info.reference_pass_name = "early_optimizations";
     pass_info.ref_pass_instance_number = 1;
     pass_info.pos_op = PASS_POS_INSERT_BEFORE;
     register_callback(plugin_name, PLUGIN_PASS_MANAGER_SETUP, NULL, &pass_info);
 
     // Turn off pass_early_local_passes::pass_all_early_optimizations.
-    pass_info.pass = &pass_gimple_null.pass;
+    pass_info.pass =
+#if (GCC_MAJOR < 5)
+        &pass_gimple_null.pass;
+#else
+        new pass_gimple_null(g);
+#endif
     pass_info.reference_pass_name = "early_optimizations";
     pass_info.ref_pass_instance_number = 0;
     pass_info.pos_op = PASS_POS_REPLACE;
@@ -2348,13 +2987,18 @@ int __attribute__((visibility("default"))) plugin_init(
     // Leave pass pass_early_local_passes::pass_tree_profile.
 
     // Turn off pass_ipa_increase_alignment.
-    pass_info.pass = &pass_simple_ipa_null.pass;
+    pass_info.pass =
+#if (GCC_MAJOR < 5)
+        &pass_simple_ipa_null.pass;
+#else
+        new pass_simple_ipa_null(g);
+#endif
     pass_info.reference_pass_name = "increase_alignment";
     pass_info.ref_pass_instance_number = 0;
     pass_info.pos_op = PASS_POS_REPLACE;
     register_callback(plugin_name, PLUGIN_PASS_MANAGER_SETUP, NULL, &pass_info);
 
-#if (GCC_MINOR < 8)
+#if GCC_VERSION_CODE < GCC_VERSION(4, 8)
     // Turn off pass_ipa_matrix_reorg.
     pass_info.pass = &pass_simple_ipa_null.pass;
     pass_info.reference_pass_name = "matrix-reorg";
@@ -2372,7 +3016,12 @@ int __attribute__((visibility("default"))) plugin_init(
     // Leave pass_ipa_profile. ???
 
     // Turn off pass_ipa_cp.
-    pass_info.pass = &pass_ipa_null.pass;
+    pass_info.pass =
+#if (GCC_MAJOR < 5)
+        &pass_ipa_null.pass;
+#else
+        new pass_ipa_null(g);
+#endif
     pass_info.reference_pass_name = "cp";
     pass_info.ref_pass_instance_number = 0;
     pass_info.pos_op = PASS_POS_REPLACE;
@@ -2381,27 +3030,42 @@ int __attribute__((visibility("default"))) plugin_init(
     // Leave pass_ipa_cdtor_merge.
 
     // Turn off pass_ipa_inline.
-    pass_info.pass = &pass_ipa_null.pass;
+    pass_info.pass =
+#if (GCC_MAJOR < 5)
+        &pass_ipa_null.pass;
+#else
+        new pass_ipa_null(g);
+#endif
     pass_info.reference_pass_name = "inline";
     pass_info.ref_pass_instance_number = 0;
     pass_info.pos_op = PASS_POS_REPLACE;
     register_callback(plugin_name, PLUGIN_PASS_MANAGER_SETUP, NULL, &pass_info);
 
     // Turn off pass_ipa_pure_const.
-    pass_info.pass = &pass_ipa_null.pass;
+    pass_info.pass =
+#if (GCC_MAJOR < 5)
+        &pass_ipa_null.pass;
+#else
+        new pass_ipa_null(g);
+#endif
     pass_info.reference_pass_name = "pure-const";
     pass_info.ref_pass_instance_number = 0;
     pass_info.pos_op = PASS_POS_REPLACE;
     register_callback(plugin_name, PLUGIN_PASS_MANAGER_SETUP, NULL, &pass_info);
 
     // Turn off pass_ipa_reference.
-    pass_info.pass = &pass_ipa_null.pass;
+    pass_info.pass =
+#if (GCC_MAJOR < 5)
+        &pass_ipa_null.pass;
+#else
+        new pass_ipa_null(g);
+#endif
     pass_info.reference_pass_name = "static-var";
     pass_info.ref_pass_instance_number = 0;
     pass_info.pos_op = PASS_POS_REPLACE;
     register_callback(plugin_name, PLUGIN_PASS_MANAGER_SETUP, NULL, &pass_info);
 
-#if (GCC_MINOR < 7)
+#if GCC_VERSION_CODE < GCC_VERSION(4, 7)
     // Turn off pass_ipa_type_escape.
     pass_info.pass = &pass_simple_ipa_null.pass;
     pass_info.reference_pass_name = "type-escape-var";
@@ -2411,13 +3075,18 @@ int __attribute__((visibility("default"))) plugin_init(
 #endif
 
     // Turn off pass_ipa_pta.
-    pass_info.pass = &pass_simple_ipa_null.pass;
+    pass_info.pass =
+#if (GCC_MAJOR < 5)
+        &pass_simple_ipa_null.pass;
+#else
+        new pass_simple_ipa_null(g);
+#endif
     pass_info.reference_pass_name = "pta";
     pass_info.ref_pass_instance_number = 0;
     pass_info.pos_op = PASS_POS_REPLACE;
     register_callback(plugin_name, PLUGIN_PASS_MANAGER_SETUP, NULL, &pass_info);
 
-#if (GCC_MINOR < 7)
+#if GCC_VERSION_CODE < GCC_VERSION(4, 7)
     // Turn off pass_ipa_struct_reorg.
     pass_info.pass = &pass_simple_ipa_null.pass;
     pass_info.reference_pass_name = "ipa_struct_reorg";
@@ -2428,19 +3097,33 @@ int __attribute__((visibility("default"))) plugin_init(
   }
 
   // Disable all LTO passes.
-  pass_info.pass = &pass_ipa_null.pass;
+#if (GCC_MAJOR < 5)
+  pass_info.pass =
+#if (GCC_MAJOR < 5)
+      &pass_ipa_null.pass;
+#else
+      new pass_ipa_null(g);
+#endif
   pass_info.reference_pass_name = "lto_gimple_out";
   pass_info.ref_pass_instance_number = 0;
   pass_info.pos_op = PASS_POS_REPLACE;
   register_callback(plugin_name, PLUGIN_PASS_MANAGER_SETUP, NULL, &pass_info);
+#endif
 
-  pass_info.pass = &pass_ipa_null.pass;
+#if (GCC_MAJOR < 5)
+  pass_info.pass =
+#if (GCC_MAJOR < 5)
+      &pass_ipa_null.pass;
+#else
+      new pass_ipa_null(g);
+#endif
   pass_info.reference_pass_name = "lto_decls_out";
   pass_info.ref_pass_instance_number = 0;
   pass_info.pos_op = PASS_POS_REPLACE;
   register_callback(plugin_name, PLUGIN_PASS_MANAGER_SETUP, NULL, &pass_info);
+#endif
 
-#if (GCC_MINOR < 6)
+#if GCC_VERSION_CODE < GCC_VERSION(4, 6)
   pass_info.pass = &pass_ipa_null.pass;
   pass_info.reference_pass_name = "lto_wpa_fixup";
   pass_info.ref_pass_instance_number = 0;
@@ -2457,14 +3140,24 @@ int __attribute__((visibility("default"))) plugin_init(
 
   if (!EnableGCCOptimizations) {
     // Disable pass_lower_eh_dispatch.
-    pass_info.pass = &pass_gimple_null.pass;
+    pass_info.pass =
+#if (GCC_MAJOR < 5)
+        &pass_gimple_null.pass;
+#else
+        new pass_gimple_null(g);
+#endif
     pass_info.reference_pass_name = "ehdisp";
     pass_info.ref_pass_instance_number = 0;
     pass_info.pos_op = PASS_POS_REPLACE;
     register_callback(plugin_name, PLUGIN_PASS_MANAGER_SETUP, NULL, &pass_info);
 
     // Disable pass_all_optimizations.
-    pass_info.pass = &pass_gimple_null.pass;
+    pass_info.pass =
+#if (GCC_MAJOR < 5)
+        &pass_gimple_null.pass;
+#else
+        new pass_gimple_null(g);
+#endif
     pass_info.reference_pass_name = "*all_optimizations";
     pass_info.ref_pass_instance_number = 0;
     pass_info.pos_op = PASS_POS_REPLACE;
@@ -2473,42 +3166,74 @@ int __attribute__((visibility("default"))) plugin_init(
     // Leave pass_tm_init.
 
     // Disable pass_lower_complex_O0.
-    pass_info.pass = &pass_gimple_null.pass;
+    pass_info.pass =
+#if (GCC_MAJOR < 5)
+        &pass_gimple_null.pass;
+#else
+        new pass_gimple_null(g);
+#endif
     pass_info.reference_pass_name = "cplxlower0";
     pass_info.ref_pass_instance_number = 0;
     pass_info.pos_op = PASS_POS_REPLACE;
     register_callback(plugin_name, PLUGIN_PASS_MANAGER_SETUP, NULL, &pass_info);
 
     // Disable pass_cleanup_eh.
-    pass_info.pass = &pass_gimple_null.pass;
+    pass_info.pass =
+#if (GCC_MAJOR < 5)
+        &pass_gimple_null.pass;
+#else
+        new pass_gimple_null(g);
+#endif
     pass_info.reference_pass_name = "ehcleanup";
     pass_info.ref_pass_instance_number = 0;
     pass_info.pos_op = PASS_POS_REPLACE;
     register_callback(plugin_name, PLUGIN_PASS_MANAGER_SETUP, NULL, &pass_info);
 
     // Disable pass_lower_resx.
-    pass_info.pass = &pass_gimple_null.pass;
+    pass_info.pass =
+#if (GCC_MAJOR < 5)
+        &pass_gimple_null.pass;
+#else
+        new pass_gimple_null(g);
+#endif
     pass_info.reference_pass_name = "resx";
     pass_info.ref_pass_instance_number = 0;
     pass_info.pos_op = PASS_POS_REPLACE;
     register_callback(plugin_name, PLUGIN_PASS_MANAGER_SETUP, NULL, &pass_info);
 
     // Disable pass_nrv.
-    pass_info.pass = &pass_gimple_null.pass;
+    pass_info.pass =
+#if (GCC_MAJOR < 5)
+        &pass_gimple_null.pass;
+#else
+        new pass_gimple_null(g);
+#endif
     pass_info.reference_pass_name = "nrv";
     pass_info.ref_pass_instance_number = 0;
     pass_info.pos_op = PASS_POS_REPLACE;
     register_callback(plugin_name, PLUGIN_PASS_MANAGER_SETUP, NULL, &pass_info);
 
     // Disable pass_mudflap_2. ???
-    pass_info.pass = &pass_gimple_null.pass;
+#if (GCC_MAJOR < 5)
+    pass_info.pass =
+#if (GCC_MAJOR < 5)
+        &pass_gimple_null.pass;
+#else
+        new pass_gimple_null(g);
+#endif
     pass_info.reference_pass_name = "mudflap2";
     pass_info.ref_pass_instance_number = 0;
     pass_info.pos_op = PASS_POS_REPLACE;
     register_callback(plugin_name, PLUGIN_PASS_MANAGER_SETUP, NULL, &pass_info);
+#endif
 
     // Disable pass_cleanup_cfg_post_optimizing.
-    pass_info.pass = &pass_gimple_null.pass;
+    pass_info.pass =
+#if (GCC_MAJOR < 5)
+        &pass_gimple_null.pass;
+#else
+        new pass_gimple_null(g);
+#endif
     pass_info.reference_pass_name = "optimized";
     pass_info.ref_pass_instance_number = 0;
     pass_info.pos_op = PASS_POS_REPLACE;
@@ -2518,24 +3243,39 @@ int __attribute__((visibility("default"))) plugin_init(
   }
 
   // Replace rtl expansion with a pass that converts functions to LLVM IR.
-  pass_info.pass = &pass_rtl_emit_function.pass;
+  pass_info.pass =
+#if (GCC_MAJOR < 5)
+      &pass_rtl_emit_function.pass;
+#else
+      new pass_rtl_emit_function(g);
+#endif
   pass_info.reference_pass_name = "expand";
   pass_info.ref_pass_instance_number = 0;
   pass_info.pos_op = PASS_POS_REPLACE;
   register_callback(plugin_name, PLUGIN_PASS_MANAGER_SETUP, NULL, &pass_info);
 
   // Turn off all other rtl passes.
-#if (GCC_MINOR < 8)
+#if GCC_VERSION_CODE < GCC_VERSION(4, 8)
   pass_info.pass = &pass_gimple_null.pass;
 #else
-  pass_info.pass = &pass_rtl_null.pass;
+  pass_info.pass =
+#if (GCC_MAJOR < 5)
+      &pass_rtl_null.pass;
+#else
+      new pass_rtl_null(g);
+#endif
 #endif
   pass_info.reference_pass_name = "*rest_of_compilation";
   pass_info.ref_pass_instance_number = 0;
   pass_info.pos_op = PASS_POS_REPLACE;
   register_callback(plugin_name, PLUGIN_PASS_MANAGER_SETUP, NULL, &pass_info);
 
-  pass_info.pass = &pass_rtl_null.pass;
+  pass_info.pass =
+#if (GCC_MAJOR < 5)
+      &pass_rtl_null.pass;
+#else
+      new pass_rtl_null(g);
+#endif
   pass_info.reference_pass_name = "*clean_state";
   pass_info.ref_pass_instance_number = 0;
   pass_info.pos_op = PASS_POS_REPLACE;

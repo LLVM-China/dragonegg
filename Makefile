@@ -42,7 +42,10 @@ else
 COMMON_FLAGS+=-fvisibility=hidden
 endif
 CFLAGS+=$(COMMON_FLAGS) $(shell $(LLVM_CONFIG) --cflags)
-CXXFLAGS+=$(COMMON_FLAGS) $(shell $(LLVM_CONFIG) --cxxflags)
+LLVM_CXXFLAGS=$(shell $(LLVM_CONFIG) --cxxflags)
+LLVM_CXXFLAGS_Wcwd=$(subst -Wcovered-switch-default, -Wno-switch-default, $(LLVM_CXXFLAGS))
+LLVM_CXXFLAGS_Wsc=$(subst -Wstring-conversion, , $(LLVM_CXXFLAGS_Wcwd))
+CXXFLAGS+=$(COMMON_FLAGS) $(LLVM_CXXFLAGS_Wsc)
 
 ifeq ($(shell uname),Darwin)
 LOADABLE_MODULE_OPTIONS=-bundle -undefined dynamic_lookup
@@ -54,13 +57,13 @@ endif
 endif
 
 GCC_PLUGIN_DIR=$(shell $(GCC) -print-file-name=plugin)
-GCC_VERSION=$(shell $(GCC) -dumpversion).0
-GCC_MAJOR=$(word 1, $(subst ., ,$(GCC_VERSION)))
-GCC_MINOR=$(word 2, $(subst ., ,$(GCC_VERSION)))
-GCC_MICRO=$(word 3, $(subst ., ,$(GCC_VERSION)))
+GCC_VERSION_STRING=$(shell $(GCC) -dumpversion).0
+GCC_MAJOR=$(word 1, $(subst ., ,$(GCC_VERSION_STRING)))
+GCC_MINOR=$(word 2, $(subst ., ,$(GCC_VERSION_STRING)))
+GCC_MICRO=$(word 3, $(subst ., ,$(GCC_VERSION_STRING)))
 TARGET_TRIPLE=$(shell $(GCC) -dumpmachine)
 
-LLVM_VERSION=$(shell $(LLVM_CONFIG) --version)
+LLVM_VERSION_STRING=$(shell $(LLVM_CONFIG) --version)
 
 PLUGIN=dragonegg.so
 PLUGIN_OBJECTS=Aliasing.o Backend.o Cache.o ConstantConversion.o Convert.o \
@@ -77,7 +80,7 @@ ALL_OBJECTS=$(PLUGIN_OBJECTS) $(TARGET_OBJECT) $(TARGET_UTIL_OBJECTS)
 CPP_OPTIONS+=$(CPPFLAGS) $(shell $(LLVM_CONFIG) --cppflags) \
 	     -fno-rtti \
 	     -MD -MP \
-	     -DIN_GCC -DLLVM_VERSION=\"$(LLVM_VERSION)\" \
+	     -DIN_GCC -DLLVM_VERSION_STRING=\"$(LLVM_VERSION_STRING)\" \
 	     -DTARGET_TRIPLE=\"$(TARGET_TRIPLE)\" \
 	     -DGCC_MAJOR=$(GCC_MAJOR) -DGCC_MINOR=$(GCC_MINOR) \
 	     -DGCC_MICRO=$(GCC_MICRO) \
@@ -92,6 +95,10 @@ ifneq ($(GCC_MINOR), 5)
       CPP_OPTIONS+=-DENABLE_BUILD_WITH_CXX
     endif
   endif
+endif
+
+ifdef DRAGONEGG_DEBUG
+CPP_OPTIONS+=-DDRAGONEGG_DEBUG -g
 endif
 
 LD_OPTIONS+=$(shell $(LLVM_CONFIG) --ldflags) $(LDFLAGS)
@@ -133,7 +140,7 @@ $(TARGET_UTIL_OBJECTS): %.o : $(TOP_DIR)/utils/%.cpp
 $(TARGET_UTIL): $(TARGET_UTIL_OBJECTS)
 	@echo Linking $@
 	$(QUIET)$(CXX) -o $@ $^ \
-	$(shell $(LLVM_CONFIG) --libs support --system-libs) \
+	$(shell $(LLVM_CONFIG) --libs support) \
 	$(LD_OPTIONS)
 
 %.o : $(SRC_DIR)/%.cpp $(TARGET_UTIL)
@@ -149,7 +156,7 @@ $(PLUGIN): $(PLUGIN_OBJECTS) $(TARGET_OBJECT) $(TARGET_UTIL)
 	@echo Linking $@
 	$(QUIET)$(CXX) -o $@ $(LOADABLE_MODULE_OPTIONS) $(CXXFLAGS) \
 	$(PLUGIN_OBJECTS) $(TARGET_OBJECT) \
-	$(shell $(LLVM_CONFIG) --libs $(LLVM_COMPONENTS) --system-libs \
+	$(shell $(LLVM_CONFIG) --libs $(LLVM_COMPONENTS) \
 	$(shell $(TARGET_UTIL) -p)) \
 	$(LD_OPTIONS)
 
@@ -191,7 +198,9 @@ clean:
 # The following target exists for the benefit of the dragonegg maintainers, and
 # is not used in a normal build.  You need to specify the path to the GCC build
 # directory in GCC_BUILD_DIR.
-GENGTYPE_INPUT=$(SRC_DIR)/Cache.cpp
+# FIXME: gengtype does not support macro https://gcc.gnu.org/ml/gcc/2017-07/msg00061.html
+# You have to comment #if (GCC_MAJOR == XXX) not feet your GCC version.
+GENGTYPE_INPUT=$(SRC_DIR)/Cache$(GCC_MAJOR).cpp
 GENGTYPE_OUTPUT=$(INCLUDE_DIR)/dragonegg/gt-cache-$(GCC_MAJOR).$(GCC_MINOR).inc
 .PHONY: gt-cache.inc
 gt-cache.inc:

@@ -22,6 +22,7 @@
 //===----------------------------------------------------------------------===//
 
 // Plugin headers
+#include "dragonegg/Internals.h"
 #include "dragonegg/Aliasing.h"
 #include "llvm/ADT/SmallVector.h"
 
@@ -30,6 +31,7 @@
 #include "llvm/IR/LLVMContext.h"
 #include "llvm/IR/MDBuilder.h"
 #include "llvm/IR/Metadata.h"
+#include "llvm/IR/Module.h"
 
 // System headers
 #include <gmp.h>
@@ -59,7 +61,12 @@ extern "C" {
 
 using namespace llvm;
 
-static LLVMContext &Context = getGlobalContext();
+// https://reviews.llvm.org/D19094
+#if LLVM_VERSION_CODE > LLVM_VERSION(3, 8)
+static LLVMContext TheContext;
+#else
+static LLVMContext &TheContext = getGlobalContext();
+#endif
 
 /// getTBAARoot - Return the root of the TBAA tree for this compilation unit.
 static MDNode *getTBAARoot() {
@@ -69,6 +76,12 @@ static MDNode *getTBAARoot() {
     // the names of the nodes we hang off it have no intrinsic meaning: nodes
     // from different compilation units must not be merged even if they have the
     // same name.
+    LLVMContext &Context =
+#if LLVM_VERSION_CODE > LLVM_VERSION(3, 8)
+        TheModule->getContext();
+#else
+        TheContext;
+#endif
     MDBuilder MDHelper(Context);
     Root = MDHelper.createAnonymousTBAARoot();
   }
@@ -148,6 +161,12 @@ MDNode *describeAliasSet(tree t) {
       TYPE_CANONICAL(TYPE_MAIN_VARIANT(isa<TYPE>(t) ? t : TREE_TYPE(t)));
   std::string TreeName =
       ("alias set " + Twine(alias_set) + ": " + getDescriptiveName(type)).str();
+  LLVMContext &Context =
+#if LLVM_VERSION_CODE > LLVM_VERSION(3, 8)
+      TheModule->getContext();
+#else
+      TheContext;
+#endif
   MDBuilder MDHelper(Context);
 
   MDNode *AliasTag = MDHelper.createTBAANode(TreeName, getTBAARoot());

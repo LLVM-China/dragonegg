@@ -32,7 +32,11 @@
 #include "llvm/IR/DataLayout.h"
 #include "llvm/IR/GlobalVariable.h"
 #include "llvm/IR/LLVMContext.h"
+#include "llvm/IR/Module.h"
 #include "llvm/Support/Host.h"
+#if LLVM_VERSION_CODE > LLVM_VERSION(3, 8)
+#include "llvm/Target/TargetMachine.h"
+#endif
 
 // System headers
 #include <gmp.h>
@@ -50,8 +54,13 @@ extern "C" {
 #include "coretypes.h"
 #include "tm.h"
 #include "tree.h"
+#if (GCC_MAJOR > 4)
+#include "print-tree.h"
+#include "stor-layout.h"
+#include "fold-const.h"
+#endif
 
-#if (GCC_MINOR < 7)
+#if GCC_VERSION_CODE < GCC_VERSION(4, 7)
 #include "flags.h" // For POINTER_TYPE_OVERFLOW_UNDEFINED.
 #endif
 #include "tm_p.h" // For CONSTANT_ALIGNMENT.
@@ -64,7 +73,9 @@ extern "C" {
 
 using namespace llvm;
 
-static LLVMContext &Context = getGlobalContext();
+#if LLVM_VERSION_CODE < LLVM_VERSION(3, 9)
+static LLVMContext &TheContext = getGlobalContext();
+#endif
 
 // Forward declarations.
 static Constant *ConvertInitializerImpl(tree, TargetFolder &);
@@ -167,6 +178,12 @@ BitSlice BitSlice::ExtendRange(SignedRange r, TargetFolder &Folder) const {
   if (R == r)
     return *this;
   assert(!r.empty() && "Empty ranges did not evaluate as equal?");
+  LLVMContext &Context =
+#if LLVM_VERSION_CODE > LLVM_VERSION(3, 8)
+    Contents ? Contents->getType()->getContext() : TheModule->getContext();
+#else
+    TheContext;
+#endif
   Type *ExtTy = IntegerType::get(Context, (unsigned) r.getWidth());
   // If the slice contains no bits then every bit of the extension is zero.
   if (empty())
@@ -200,6 +217,12 @@ Constant *BitSlice::getBits(SignedRange r, TargetFolder &Folder) const {
   // Quick exit if the desired range matches that of the slice.
   if (R == r)
     return Contents;
+  LLVMContext &Context =
+#if LLVM_VERSION_CODE > LLVM_VERSION(3, 8)
+    Contents ? Contents->getType()->getContext() : TheModule->getContext();
+#else
+    TheContext;
+#endif
   Type *RetTy = IntegerType::get(Context, (unsigned) r.getWidth());
   // If the slice contains no bits then every returned bit is undefined.
   if (empty())
@@ -261,6 +284,12 @@ BitSlice BitSlice::ReduceRange(SignedRange r, TargetFolder &Folder) const {
     C = Folder.CreateLShr(C, ShiftAmt);
   }
   // Truncate to the new type.
+  LLVMContext &Context =
+#if LLVM_VERSION_CODE > LLVM_VERSION(3, 8)
+    C ? C->getType()->getContext() : TheModule->getContext();
+#else
+    TheContext;
+#endif
   Type *RedTy = IntegerType::get(Context, (unsigned) r.getWidth());
   C = Folder.CreateTruncOrBitCast(C, RedTy);
   return BitSlice(r, C);
@@ -276,6 +305,12 @@ static BitSlice ViewAsBits(Constant *C, SignedRange R, TargetFolder &Folder) {
 
   // Sanitize the range to make life easier in what follows.
   Type *Ty = C->getType();
+  LLVMContext &Context =
+#if LLVM_VERSION_CODE > LLVM_VERSION(3, 8)
+    Ty->getContext();
+#else
+    TheContext;
+#endif
   int StoreSize = getDataLayout().getTypeStoreSizeInBits(Ty);
   R = R.Meet(SignedRange(0, StoreSize));
 
@@ -416,6 +451,13 @@ InterpretAsType(Constant *C, Type *Ty, int StartingBit, TargetFolder &Folder) {
   if (C->isNullValue())
     return Constant::getNullValue(Ty);
 
+  LLVMContext &Context =
+#if LLVM_VERSION_CODE > LLVM_VERSION(3, 8)
+      Ty->getContext();
+#else
+      TheContext;
+#endif
+
   // The general case.
   switch (Ty->getTypeID()) {
   default:
@@ -523,6 +565,12 @@ static Constant *ExtractRegisterFromConstantImpl(
     // This roundabout approach means we get the right result on both little and
     // big endian machines.
     unsigned Size = GET_MODE_BITSIZE(TYPE_MODE(type));
+    LLVMContext &Context =
+#if LLVM_VERSION_CODE > LLVM_VERSION(3, 8)
+        C ? C->getType()->getContext() : TheModule->getContext();
+#else
+        TheContext;
+#endif
     Type *MemTy = IntegerType::get(Context, Size);
     C = InterpretAsType(C, MemTy, StartingBit, Folder);
     return Folder.CreateTruncOrBitCast(C, getRegType(type));
@@ -538,7 +586,7 @@ static Constant *ExtractRegisterFromConstantImpl(
     return ConstantStruct::getAnon(Vals);
   }
 
-#if (GCC_MINOR > 5)
+#if GCC_VERSION_CODE > GCC_VERSION(4, 5)
   case NULLPTR_TYPE:
 #endif
   case OFFSET_TYPE:
@@ -572,7 +620,11 @@ static Constant *ExtractRegisterFromConstantImpl(
 /// byte StartingByte.
 Constant *
 ExtractRegisterFromConstant(Constant *C, tree type, int StartingByte) {
+#if LLVM_VERSION_CODE > LLVM_VERSION(3, 8)
+  TargetFolder Folder(TheModule->getDataLayout());
+#else
   TargetFolder Folder(&getDataLayout());
+#endif
   return ExtractRegisterFromConstantImpl(C, type, StartingByte, Folder);
 }
 
@@ -596,6 +648,12 @@ RepresentAsMemory(Constant *C, tree type, TargetFolder &Folder) {
   // NOTE: Needs to be kept in sync with ExtractRegisterFromConstant.
   assert(C->getType() == getRegType(type) && "Constant has wrong type!");
   Constant *Result;
+  LLVMContext &Context =
+#if LLVM_VERSION_CODE > LLVM_VERSION(3, 8)
+      C->getType()->getContext();
+#else
+      TheContext;
+#endif
 
   switch (TREE_CODE(type)) {
 
@@ -629,7 +687,7 @@ RepresentAsMemory(Constant *C, tree type, TargetFolder &Folder) {
     break;
   }
 
-#if (GCC_MINOR > 5)
+#if GCC_VERSION_CODE > GCC_VERSION(4, 5)
   case NULLPTR_TYPE:
 #endif
   case OFFSET_TYPE:
@@ -730,6 +788,12 @@ static Constant *ConvertCST(tree exp, TargetFolder &) {
   (void)
       CharsWritten; // Avoid unused variable warning when assertions disabled.
                     // Turn it into an LLVM byte array.
+  LLVMContext &Context =
+#if LLVM_VERSION_CODE > LLVM_VERSION(3, 8)
+      TheModule->getContext();
+#else
+      TheContext;
+#endif
   return ConstantDataArray::get(Context, Buffer);
 }
 
@@ -738,6 +802,12 @@ static Constant *ConvertSTRING_CST(tree exp, TargetFolder &) {
   // just those with a byte component type; then ConvertCST can handle strings.
   ArrayType *StrTy = cast<ArrayType>(ConvertType(TREE_TYPE(exp)));
   Type *ElTy = StrTy->getElementType();
+  LLVMContext &Context =
+#if LLVM_VERSION_CODE > LLVM_VERSION(3, 8)
+      ElTy->getContext();
+#else
+      TheContext;
+#endif
 
   unsigned Len = (unsigned) TREE_STRING_LENGTH(exp);
 
@@ -816,6 +886,12 @@ static Constant *ConvertArrayCONSTRUCTOR(tree exp, TargetFolder &Folder) {
 
   tree init_type = main_type(exp);
   Type *InitTy = ConvertType(init_type);
+  LLVMContext &Context =
+#if LLVM_VERSION_CODE > LLVM_VERSION(3, 8)
+      InitTy->getContext();
+#else
+      TheContext;
+#endif
 
   tree elt_type = main_type(init_type);
   Type *EltTy = ConvertType(elt_type);
@@ -882,16 +958,34 @@ static Constant *ConvertArrayCONSTRUCTOR(tree exp, TargetFolder &Folder) {
         last = fold_build2(MINUS_EXPR, main_type(last), last, lower_bnd);
       }
 
+#if (GCC_MAJOR > 4)
+      assert(tree_fits_uhwi_p(first) && tree_fits_uhwi_p(last) &&
+             "Unknown range_expr!");
+#else
       assert(host_integerp(first, 1) && host_integerp(last, 1) &&
              "Unknown range_expr!");
+#endif
+#if (GCC_MAJOR > 4)
+      FirstIndex = tree_to_shwi(first);
+      LastIndex = tree_to_shwi(last);
+#else
       FirstIndex = tree_low_cst(first, 1);
       LastIndex = tree_low_cst(last, 1);
+#endif
     } else {
       // Subtract off the lower bound if any to ensure indices start from zero.
       if (lower_bnd != NULL_TREE)
         index = fold_build2(MINUS_EXPR, main_type(index), index, lower_bnd);
+#if (GCC_MAJOR > 4)
+      assert(tree_fits_uhwi_p(index));
+#else
       assert(host_integerp(index, 1));
+#endif
+#if (GCC_MAJOR > 4)
+      FirstIndex = tree_to_shwi(index);
+#else
       FirstIndex = tree_low_cst(index, 1);
+#endif
       LastIndex = FirstIndex;
     }
 
@@ -1001,6 +1095,12 @@ class FieldContents {
   Constant *getAsBits() const {
     if (R.empty())
       return 0;
+    LLVMContext &Context =
+#if LLVM_VERSION_CODE > LLVM_VERSION(3, 8)
+        C ? C->getType()->getContext() : TheModule->getContext();
+#else
+        TheContext;
+#endif
     Type *IntTy = IntegerType::get(Context, R.getWidth());
     return InterpretAsType(C, IntTy, R.getFirst() - Starts, Folder);
   }
@@ -1040,7 +1140,9 @@ public:
     R = other.R;
     C = other.C;
     Starts = other.Starts;
+#if LLVM_VERSION_CODE < LLVM_VERSION(3, 9)
     Folder = other.Folder;
+#endif
     return *this;
   }
 
@@ -1066,6 +1168,12 @@ public:
     /// in the range then just return it.
     if (isSafeToReturnContentsDirectly(DL))
       return C;
+    LLVMContext &Context =
+#if LLVM_VERSION_CODE > LLVM_VERSION(3, 8)
+        C ? C->getType()->getContext() : TheModule->getContext();
+#else
+        TheContext;
+#endif
     // If the range is empty then return a constant with zero size.
     if (R.empty()) {
       // Return an empty array.  Remember the returned value as an optimization
@@ -1080,7 +1188,11 @@ public:
       Type *Ty = C->getType();
       assert(Ty->isIntegerTy() && "Non-integer type with non-byte size!");
       unsigned BitWidth =
+#if LLVM_VERSION_CODE > LLVM_VERSION(3, 8)
+          alignTo(Ty->getPrimitiveSizeInBits(), BITS_PER_UNIT);
+#else
           RoundUpToAlignment(Ty->getPrimitiveSizeInBits(), BITS_PER_UNIT);
+#endif
       Ty = IntegerType::get(Context, BitWidth);
       C = TheFolder->CreateZExtOrBitCast(C, Ty);
       if (isSafeToReturnContentsDirectly(DL))
@@ -1129,6 +1241,12 @@ static Constant *ConvertRecordCONSTRUCTOR(tree exp, TargetFolder &Folder) {
   const DataLayout &DL = getDataLayout();
   tree type = main_type(exp);
   Type *Ty = ConvertType(type);
+  LLVMContext &Context =
+#if LLVM_VERSION_CODE > LLVM_VERSION(3, 8)
+      Ty->getContext();
+#else
+      TheContext;
+#endif
   uint64_t TypeSize = DL.getTypeAllocSizeInBits(Ty);
 
   // Ensure that fields without an initial value are default initialized by
@@ -1294,7 +1412,7 @@ static Constant *ConvertRecordCONSTRUCTOR(tree exp, TargetFolder &Folder) {
 
   // Okay, we're done.  Return the computed elements as a constant with the type
   // of exp if possible.
-  if (StructType *STy = dyn_cast<StructType>(Ty))
+  if (StructType *STy = llvm::dyn_cast<StructType>(Ty))
     if (STy->isPacked() == Pack && STy->getNumElements() == Elts.size()) {
       bool EltTypesMatch = true;
       for (unsigned i = 0, e = Elts.size(); i != e; ++i) {
@@ -1363,12 +1481,28 @@ static Constant *ConvertPLUS_EXPR(tree exp, TargetFolder &Folder) {
 static Constant *ConvertPOINTER_PLUS_EXPR(tree exp, TargetFolder &Folder) {
   Constant *Ptr = getAsRegister(TREE_OPERAND(exp, 0), Folder); // Pointer
   Constant *Idx = getAsRegister(TREE_OPERAND(exp, 1), Folder); // Offset (units)
+  LLVMContext &Context =
+#if LLVM_VERSION_CODE > LLVM_VERSION(3, 8)
+      Ptr->getType()->getContext();
+#else
+      TheContext;
+#endif
 
   // Convert the pointer into an i8* and add the offset to it.
   Ptr = Folder.CreateBitCast(Ptr, GetUnitPointerType(Context));
-  Constant *Result = POINTER_TYPE_OVERFLOW_UNDEFINED
+  Constant *Result =
+#if (GCC_MAJOR > 7)
+      true
+#else
+      POINTER_TYPE_OVERFLOW_UNDEFINED
+#endif
+#if LLVM_VERSION_CODE > LLVM_VERSION(3, 8)
+                     ? Folder.CreateInBoundsGetElementPtr(nullptr, Ptr, Idx)
+                     : Folder.CreateGetElementPtr(nullptr, Ptr, Idx);
+#else
                      ? Folder.CreateInBoundsGetElementPtr(Ptr, Idx)
                      : Folder.CreateGetElementPtr(Ptr, Idx);
+#endif
 
   // The result may be of a different pointer type.
   Result = Folder.CreateBitCast(Result, getRegType(TREE_TYPE(exp)));
@@ -1472,7 +1606,11 @@ static Constant *ConvertInitializerImpl(tree exp, TargetFolder &Folder) {
 /// initial value may exceed the alloc size of the LLVM memory type generated
 /// for the GCC type (see ConvertType); it is never smaller than the alloc size.
 Constant *ConvertInitializer(tree exp) {
+#if LLVM_VERSION_CODE > LLVM_VERSION(3, 8)
+  TargetFolder Folder(TheModule->getDataLayout());
+#else
   TargetFolder Folder(&getDataLayout());
+#endif
   return ConvertInitializerImpl(exp, Folder);
 }
 
@@ -1503,7 +1641,13 @@ static Constant *AddressOfSimpleConstant(tree exp, TargetFolder &Folder) {
   // Allow identical constants to be merged if the user allowed it.
   // FIXME: maybe this flag should be set unconditionally, and instead the
   // ConstantMerge pass should be disabled if flag_merge_constants is zero.
+#if LLVM_VERSION_CODE > LLVM_VERSION(3, 8)
+  Slot->setUnnamedAddr(flag_merge_constants >= 2 ?
+          llvm::GlobalValue::UnnamedAddr::Global :
+          llvm::GlobalValue::UnnamedAddr::Local);
+#else
   Slot->setUnnamedAddr(flag_merge_constants);
+#endif
 
   return Slot;
 }
@@ -1537,9 +1681,19 @@ static Constant *AddressOfARRAY_REF(tree exp, TargetFolder &Folder) {
   Type *EltTy = ConvertType(main_type(main_type(array)));
   ArrayAddr = Folder.CreateBitCast(ArrayAddr, EltTy->getPointerTo());
 
-  return POINTER_TYPE_OVERFLOW_UNDEFINED
+  return
+#if (GCC_MAJOR > 7)
+      true
+#else
+      POINTER_TYPE_OVERFLOW_UNDEFINED
+#endif
+#if LLVM_VERSION_CODE > LLVM_VERSION(3, 8)
+         ? Folder.CreateInBoundsGetElementPtr(nullptr, ArrayAddr, IndexVal)
+         : Folder.CreateGetElementPtr(nullptr, ArrayAddr, IndexVal);
+#else
          ? Folder.CreateInBoundsGetElementPtr(ArrayAddr, IndexVal)
          : Folder.CreateGetElementPtr(ArrayAddr, IndexVal);
+#endif
 }
 
 /// AddressOfCOMPONENT_REF - Return the address of a field in a record.
@@ -1547,7 +1701,7 @@ static Constant *AddressOfCOMPONENT_REF(tree exp, TargetFolder &Folder) {
   tree field_decl = TREE_OPERAND(exp, 1);
 
   // Compute the field offset in units from the start of the record.
-  Constant *Offset;
+  Constant *Offset = NULL;
   if (TREE_OPERAND(exp, 2)) {
     Offset = getAsRegister(TREE_OPERAND(exp, 2), Folder);
     // At this point the offset is measured in units divided by (exactly)
@@ -1574,10 +1728,20 @@ static Constant *AddressOfCOMPONENT_REF(tree exp, TargetFolder &Folder) {
   assert(BitStart == 0 &&
          "It's a bitfield reference or we didn't get to the field!");
 
+  LLVMContext &Context =
+#if LLVM_VERSION_CODE > LLVM_VERSION(3, 8)
+      Offset ? Offset->getType()->getContext() : TheModule->getContext();
+#else
+      TheContext;
+#endif
   Type *UnitPtrTy = GetUnitPointerType(Context);
   Constant *StructAddr = AddressOfImpl(TREE_OPERAND(exp, 0), Folder);
   Constant *FieldPtr = Folder.CreateBitCast(StructAddr, UnitPtrTy);
+#if LLVM_VERSION_CODE > LLVM_VERSION(3, 8)
+  FieldPtr = Folder.CreateInBoundsGetElementPtr(nullptr, FieldPtr, Offset);
+#else
   FieldPtr = Folder.CreateInBoundsGetElementPtr(FieldPtr, Offset);
+#endif
 
   return FieldPtr;
 }
@@ -1618,7 +1782,7 @@ static Constant *AddressOfLABEL_DECL(tree exp, TargetFolder &) {
   return TheTreeToLLVM->AddressOfLABEL_DECL(exp);
 }
 
-#if (GCC_MINOR > 5)
+#if GCC_VERSION_CODE > GCC_VERSION(4, 5)
 /// AddressOfMEM_REF - Return the address of a memory reference.
 static Constant *AddressOfMEM_REF(tree exp, TargetFolder &Folder) {
   // The address is the first operand offset in bytes by the second.
@@ -1627,17 +1791,27 @@ static Constant *AddressOfMEM_REF(tree exp, TargetFolder &Folder) {
     return Addr;
 
   // Convert to a byte pointer and displace by the offset.
+  LLVMContext &Context =
+#if LLVM_VERSION_CODE > LLVM_VERSION(3, 8)
+      TheModule->getContext();
+#else
+      TheContext;
+#endif
   Addr = Folder.CreateBitCast(Addr, GetUnitPointerType(Context));
   APInt Delta = getAPIntValue(TREE_OPERAND(exp, 1));
   Constant *Offset = ConstantInt::get(Context, Delta);
   // The address is always inside the referenced object, so "inbounds".
-  return Folder.CreateInBoundsGetElementPtr(Addr, Offset);
+  return Folder.CreateInBoundsGetElementPtr(
+#if LLVM_VERSION_CODE > LLVM_VERSION(3, 8)
+          nullptr,
+#endif
+          Addr, Offset);
 }
 #endif
 
 /// AddressOfImpl - Implementation of AddressOf.
 static Constant *AddressOfImpl(tree exp, TargetFolder &Folder) {
-  Constant *Addr;
+  Constant *Addr = NULL;
 
   switch (TREE_CODE(exp)) {
   default:
@@ -1670,7 +1844,7 @@ static Constant *AddressOfImpl(tree exp, TargetFolder &Folder) {
     Addr = AddressOfDecl(exp, Folder);
     break;
   case INDIRECT_REF:
-#if (GCC_MINOR < 6)
+#if GCC_VERSION_CODE < GCC_VERSION(4, 6)
   case MISALIGNED_INDIRECT_REF:
 #endif
     Addr = AddressOfINDIRECT_REF(exp, Folder);
@@ -1678,7 +1852,7 @@ static Constant *AddressOfImpl(tree exp, TargetFolder &Folder) {
   case LABEL_DECL:
     Addr = AddressOfLABEL_DECL(exp, Folder);
     break;
-#if (GCC_MINOR > 5)
+#if GCC_VERSION_CODE > GCC_VERSION(4, 5)
   case MEM_REF:
     Addr = AddressOfMEM_REF(exp, Folder);
     break;
@@ -1688,6 +1862,12 @@ static Constant *AddressOfImpl(tree exp, TargetFolder &Folder) {
   // Ensure that the address has the expected type.  It is simpler to do this
   // once here rather than in every AddressOf helper.
   Type *Ty;
+  LLVMContext &Context =
+#if LLVM_VERSION_CODE > LLVM_VERSION(3, 8)
+      Addr ? Addr->getType()->getContext() : TheModule->getContext();
+#else
+      TheContext;
+#endif
   if (isa<VOID_TYPE>(TREE_TYPE(exp)))
     Ty = GetUnitPointerType(Context); // void* -> i8*.
   else
@@ -1702,6 +1882,10 @@ static Constant *AddressOfImpl(tree exp, TargetFolder &Folder) {
 /// type of the pointee is the memory type that corresponds to the type of exp
 /// (see ConvertType).
 Constant *AddressOf(tree exp) {
+#if LLVM_VERSION_CODE > LLVM_VERSION(3, 8)
+  TargetFolder Folder(TheModule->getDataLayout());
+#else
   TargetFolder Folder(&getDataLayout());
+#endif
   return AddressOfImpl(exp, Folder);
 }

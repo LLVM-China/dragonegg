@@ -23,6 +23,9 @@
 // Plugin headers
 #include "dragonegg/ABI.h"
 
+// LLVM headers
+#include "llvm/IR/Module.h"
+
 // System headers
 #include <gmp.h>
 
@@ -39,6 +42,9 @@ extern "C" {
 #include "coretypes.h"
 #include "tm.h"
 #include "tree.h"
+#if (GCC_MAJOR > 4)
+#include "function.h"
+#endif
 #ifndef ENABLE_BUILD_WITH_CXX
 } // extern "C"
 #endif
@@ -116,7 +122,7 @@ tree isSingleElementStructOrArray(tree type, bool ignoreZeroLength,
            ? isSingleElementStructOrArray(FoundField, ignoreZeroLength, false)
            : 0;
   case ARRAY_TYPE:
-    ArrayType *Ty = dyn_cast<ArrayType>(ConvertType(type));
+    ArrayType *Ty = llvm::dyn_cast<ArrayType>(ConvertType(type));
     if (!Ty || Ty->getNumElements() != 1)
       return 0;
     return isSingleElementStructOrArray(TREE_TYPE(type), false, false);
@@ -204,7 +210,13 @@ void DefaultABI::HandleArgument(tree type, std::vector<Type *> &ScalarElts,
   std::vector<Type *> Elts;
   if (Ty->isVoidTy()) {
     // Handle void explicitly as a {} type.
-    Type *OpTy = StructType::get(getGlobalContext());
+    Type *OpTy = StructType::get(
+#if LLVM_VERSION_CODE > LLVM_VERSION(3, 8)
+            Ty->getContext()
+#else
+            getGlobalContext()
+#endif
+            );
     C.HandleScalarArgument(OpTy, type);
     ScalarElts.push_back(OpTy);
   } else if (isPassedByInvisibleReference(type)) { // variable size -> by-ref.
@@ -343,6 +355,11 @@ void DefaultABI::PassInIntegerRegisters(
     Size = origSize;
   else
     Size = TREE_INT_CST_LOW(TYPE_SIZE(type)) / 8;
+#if LLVM_VERSION_CODE > LLVM_VERSION(3, 8)
+  LLVMContext &Context = TheModule->getContext();
+#else
+  LLVMContext &Context = getGlobalContext();
+#endif
 
   // FIXME: We should preserve all aggregate value alignment information.
   // Work around to preserve some aggregate value alignment information:
@@ -350,7 +367,7 @@ void DefaultABI::PassInIntegerRegisters(
   // from Int64 alignment. ARM backend needs this.
   unsigned Align = TYPE_ALIGN(type) / 8;
   unsigned Int64Align =
-      getDataLayout().getABITypeAlignment(Type::getInt64Ty(getGlobalContext()));
+      getDataLayout().getABITypeAlignment(Type::getInt64Ty(Context));
   bool UseInt64 = (DontCheckAlignment || Align >= Int64Align);
 
   unsigned ElementSize = UseInt64 ? 8 : 4;
@@ -361,8 +378,8 @@ void DefaultABI::PassInIntegerRegisters(
   Type *ArrayElementType = NULL;
   if (ArraySize) {
     Size = Size % ElementSize;
-    ArrayElementType = (UseInt64 ? Type::getInt64Ty(getGlobalContext())
-                                 : Type::getInt32Ty(getGlobalContext()));
+    ArrayElementType = (UseInt64 ? Type::getInt64Ty(Context)
+                                 : Type::getInt32Ty(Context));
     ATy = ArrayType::get(ArrayElementType, ArraySize);
   }
 
@@ -370,13 +387,13 @@ void DefaultABI::PassInIntegerRegisters(
   unsigned LastEltRealSize = 0;
   llvm::Type *LastEltTy = 0;
   if (Size > 4) {
-    LastEltTy = Type::getInt64Ty(getGlobalContext());
+    LastEltTy = Type::getInt64Ty(Context);
   } else if (Size > 2) {
-    LastEltTy = Type::getInt32Ty(getGlobalContext());
+    LastEltTy = Type::getInt32Ty(Context);
   } else if (Size > 1) {
-    LastEltTy = Type::getInt16Ty(getGlobalContext());
+    LastEltTy = Type::getInt16Ty(Context);
   } else if (Size > 0) {
-    LastEltTy = Type::getInt8Ty(getGlobalContext());
+    LastEltTy = Type::getInt8Ty(Context);
   }
   if (LastEltTy) {
     if (Size != getDataLayout().getTypeAllocSize(LastEltTy))
@@ -388,7 +405,7 @@ void DefaultABI::PassInIntegerRegisters(
     Elts.push_back(ATy);
   if (LastEltTy)
     Elts.push_back(LastEltTy);
-  StructType *STy = StructType::get(getGlobalContext(), Elts, false);
+  StructType *STy = StructType::get(Context, Elts, false);
 
   unsigned i = 0;
   if (ArraySize) {
@@ -419,14 +436,20 @@ void DefaultABI::PassInMixedRegisters(Type *Ty, std::vector<Type *> &OrigElts,
   // that occupies storage but has no useful information, and is not passed
   // anywhere".  Happens on x86-64.
   std::vector<Type *> Elts(OrigElts);
+  LLVMContext &Context =
+#if LLVM_VERSION_CODE > LLVM_VERSION(3, 8)
+    Ty->getContext();
+#else
+    getGlobalContext();
+#endif
   Type *wordType = getDataLayout().getPointerSize(0) == 4
-                   ? Type::getInt32Ty(getGlobalContext())
-                   : Type::getInt64Ty(getGlobalContext());
+                   ? Type::getInt32Ty(Context)
+                   : Type::getInt64Ty(Context);
   for (unsigned i = 0, e = Elts.size(); i != e; ++i)
     if (OrigElts[i]->isVoidTy())
       Elts[i] = wordType;
 
-  StructType *STy = StructType::get(getGlobalContext(), Elts, false);
+  StructType *STy = StructType::get(Context, Elts, false);
 
   unsigned Size = getDataLayout().getTypeAllocSize(STy);
   unsigned InSize = 0;

@@ -5,20 +5,21 @@
 Prerequisites
 -------------
 
-The dragonegg plugin works with gcc 4.5, 4.6, 4.7 or 4.8, so you will need to
-have one of these installed.  Many linux distributions ship one or both of them,
-perhaps as an addon package; binaries can be downloaded for most platforms.
-Otherwise you can always build gcc yourself.  Plugin support (--enable-plugin)
-needs to be enabled in gcc, but since it is enabled by default on most platforms
-you usually won't need to do this explicitly.
+The dragonegg plugin works with gcc 4.5, 4.6, 4.7 or 4.8, 6.3, 6.4, 8.x so you 
+will need to have one of these installed. Many linux distributions ship one or 
+both of them, perhaps as an addon package; binaries can be downloaded for most 
+platforms. Otherwise you can always build gcc (such as GCC v8.x)yourself. 
+Plugin support (--enable-plugin) needs to be enabled in gcc, but since it is 
+enabled by default on most platforms you usually won't need to do this explicitly.
 
 Step 0: Build and install llvm
 ------------------------------
 
-I'm assuming anyone reading this knows how to build and install llvm.  The
+I'm assuming anyone reading this knows how to build and install llvm. The
 version of llvm must match the version of the plugin, so if you are building
 dragonegg-3.0 then you should use llvm-3.0, while if you are building the
-development version of dragonegg then use the development version of llvm.
+development version of dragonegg then use the development version of llvm (such 
+as LLVM v4.x, v5.x and v6.x).
 
 
 Step 1: Build the plugin

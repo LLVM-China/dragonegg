@@ -23,18 +23,48 @@
 #ifndef DRAGONEGG_INTERNALS_H
 #define DRAGONEGG_INTERNALS_H
 
+#define LLVM_VERSION(major, minor) (((major) << 8) | (minor))
+#define LLVM_VERSION_CODE LLVM_VERSION(LLVM_VERSION_MAJOR, LLVM_VERSION_MINOR)
+
 // LLVM headers
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/SetVector.h"
 #include "llvm/ADT/SmallPtrSet.h"
+#if LLVM_VERSION_CODE > LLVM_VERSION(3, 3)
 #include "llvm/Analysis/TargetFolder.h"
+#else
+#include "llvm/Support/TargetFolder.h"
+#endif
 #include "llvm/IR/IRBuilder.h"
 #include "llvm/IR/Intrinsics.h"
 #include "llvm/Support/ErrorHandling.h"
 #include "llvm/Support/FormattedStream.h"
 
+#include "dragonegg/TypeConversion.h"
+
+#if LLVM_VERSION_CODE >= LLVM_VERSION(3, 0)
+#  define LLVM_TYPE_Q
+#else
+#  define LLVM_TYPE_Q const
+#endif
+
+#define GCC_VERSION(major, minor) (((major) << 8) | (minor))
+#define GCC_VERSION_CODE GCC_VERSION(GCC_MAJOR, GCC_MINOR)
+
+#if LLVM_VERSION_CODE > LLVM_VERSION(3, 0)
+#define LLVM_END_WITH_NULL __attribute__((sentinel))
+#else
+#define LLVM_END_WITH_NULL
+#endif
+
 struct basic_block_def;
 union gimple_statement_d;
+#if (GCC_MAJOR > 4)
+struct gimple;
+typedef struct gimple GimpleTy;
+#else
+typedef union gimple_statement_d GimpleTy;
+#endif
 union tree_node;
 
 namespace llvm {
@@ -57,7 +87,11 @@ template <typename> class TrackingVH;
 }
 class DebugInfo;
 
-typedef llvm::IRBuilder<true, llvm::TargetFolder> LLVMBuilder;
+typedef llvm::IRBuilder<
+#if LLVM_VERSION_CODE < LLVM_VERSION(3, 9)
+                        true,
+#endif
+                        llvm::TargetFolder> LLVMBuilder;
 
 // Global state.
 
@@ -208,7 +242,7 @@ public:
 
 /// PhiRecord - This struct holds the LLVM PHI node associated with a GCC phi.
 struct PhiRecord {
-  gimple_statement_d *gcc_phi;
+  GimpleTy *gcc_phi;
   llvm::PHINode *PHI;
 };
 
@@ -464,27 +498,27 @@ private:
 
   //===------------------ Render* - Convert GIMPLE to LLVM ----------------===//
 
-  void RenderGIMPLE_ASM(gimple_statement_d *stmt);
-  void RenderGIMPLE_ASSIGN(gimple_statement_d *stmt);
-  void RenderGIMPLE_CALL(gimple_statement_d *stmt);
-  void RenderGIMPLE_COND(gimple_statement_d *stmt);
-  void RenderGIMPLE_EH_DISPATCH(gimple_statement_d *stmt);
-  void RenderGIMPLE_GOTO(gimple_statement_d *stmt);
-  void RenderGIMPLE_RESX(gimple_statement_d *stmt);
-  void RenderGIMPLE_RETURN(gimple_statement_d *stmt);
-  void RenderGIMPLE_SWITCH(gimple_statement_d *stmt);
+  void RenderGIMPLE_ASM(GimpleTy *stmt);
+  void RenderGIMPLE_ASSIGN(GimpleTy *stmt);
+  void RenderGIMPLE_CALL(GimpleTy *stmt);
+  void RenderGIMPLE_COND(GimpleTy *stmt);
+  void RenderGIMPLE_EH_DISPATCH(GimpleTy *stmt);
+  void RenderGIMPLE_GOTO(GimpleTy *stmt);
+  void RenderGIMPLE_RESX(GimpleTy *stmt);
+  void RenderGIMPLE_RETURN(GimpleTy *stmt);
+  void RenderGIMPLE_SWITCH(GimpleTy *stmt);
 
   // Render helpers.
 
   /// EmitAssignRHS - Convert the RHS of a scalar GIMPLE_ASSIGN to LLVM.
-  llvm::Value *EmitAssignRHS(gimple_statement_d *stmt);
+  llvm::Value *EmitAssignRHS(GimpleTy *stmt);
 
   /// EmitAssignSingleRHS - Helper for EmitAssignRHS.  Handles those RHS that
   /// are not register expressions.
   llvm::Value *EmitAssignSingleRHS(tree_node *rhs);
 
   /// OutputCallRHS - Convert the RHS of a GIMPLE_CALL.
-  llvm::Value *OutputCallRHS(gimple_statement_d *stmt, const MemRef *DestLoc);
+  llvm::Value *OutputCallRHS(GimpleTy *stmt, const MemRef *DestLoc);
 
   /// WriteScalarToLHS - Store RHS, a non-aggregate value, into the given LHS.
   void WriteScalarToLHS(tree_node *lhs, llvm::Value *Scalar);
@@ -565,7 +599,7 @@ private:
   llvm::Value *EmitReg_TRUNC_DIV_EXPR(tree_node *op0, tree_node *op1,
                                       bool isExact);
   llvm::Value *EmitReg_TRUNC_MOD_EXPR(tree_node *op0, tree_node *op1);
-#if (GCC_MINOR < 7)
+#if GCC_VERSION_CODE < GCC_VERSION(4, 7)
   llvm::Value *EmitReg_VEC_EXTRACT_EVEN_EXPR(tree_node *op0, tree_node *op1);
   llvm::Value *EmitReg_VEC_EXTRACT_ODD_EXPR(tree_node *op0, tree_node *op1);
   llvm::Value *EmitReg_VEC_INTERLEAVE_HIGH_EXPR(tree_node *op0, tree_node *op1);
@@ -584,10 +618,10 @@ private:
 
   // Ternary expressions.
   llvm::Value *EmitReg_CondExpr(tree_node *op0, tree_node *op1, tree_node *op2);
-#if (GCC_MINOR > 5)
+#if GCC_VERSION_CODE > GCC_VERSION(4, 5)
   llvm::Value *EmitReg_FMA_EXPR(tree_node *op0, tree_node *op1, tree_node *op2);
 #endif
-#if (GCC_MINOR > 6)
+#if GCC_VERSION_CODE > GCC_VERSION(4, 6)
   llvm::Value *EmitReg_VEC_PERM_EXPR(tree_node *op0, tree_node *op1,
                                      tree_node *op2);
 #endif
@@ -595,11 +629,11 @@ private:
   llvm::Value *EmitLoadOfLValue(tree_node *exp);
   llvm::Value *EmitOBJ_TYPE_REF(tree_node *exp);
   llvm::Value *EmitADDR_EXPR(tree_node *exp);
-#if (GCC_MINOR < 7)
+#if GCC_VERSION_CODE < GCC_VERSION(4, 7)
   llvm::Value *EmitCondExpr(tree_node *exp);
 #endif
-  llvm::Value *EmitCallOf(llvm::Value *Callee, gimple_statement_d *stmt,
-                          const MemRef *DestLoc, const llvm::AttributeSet &PAL);
+  llvm::Value *EmitCallOf(llvm::Value *Callee, GimpleTy *stmt,
+                          const MemRef *DestLoc, const MigAttributeSet &PAL);
   llvm::CallInst *EmitSimpleCall(llvm::StringRef CalleeName,
                                  tree_node *ret_type,
                                  /* arguments */ ...) LLVM_END_WITH_NULL;
@@ -613,74 +647,71 @@ private:
   llvm::Value *BuildVector(const std::vector<llvm::Value *> &Elts);
   llvm::Value *BuildVector(llvm::Value *Elt, ...);
   llvm::Value *BuildVectorShuffle(llvm::Value *InVec1, llvm::Value *InVec2, ...);
-  llvm::Value *BuildBinaryAtomic(gimple_statement_d *stmt,
+  llvm::Value *BuildBinaryAtomic(GimpleTy *stmt,
                                  llvm::AtomicRMWInst::BinOp Kind,
                                  unsigned PostOp = 0);
   llvm::Value *
-  BuildCmpAndSwapAtomic(gimple_statement_d *stmt, unsigned Bits, bool isBool);
+  BuildCmpAndSwapAtomic(GimpleTy *stmt, unsigned Bits, bool isBool);
 
   // Builtin Function Expansion.
-  bool EmitBuiltinCall(gimple_statement_d *stmt, tree_node *fndecl,
+  bool EmitBuiltinCall(GimpleTy *stmt, tree_node *fndecl,
                        const MemRef *DestLoc, llvm::Value *&Result);
-  bool EmitFrontendExpandedBuiltinCall(gimple_statement_d *stmt,
-                                       tree_node *fndecl, const MemRef *DestLoc,
+  bool EmitFrontendExpandedBuiltinCall(GimpleTy *stmt, tree_node *fndecl,
+                                       const MemRef *DestLoc,
                                        llvm::Value *&Result);
   bool EmitBuiltinUnaryOp(llvm::Value *InVal, llvm::Value *&Result,
                           llvm::Intrinsic::ID Id);
   llvm::Value *
-  EmitBuiltinBitCountIntrinsic(gimple_statement_d *stmt,
-                               llvm::Intrinsic::ID Id);
-  llvm::Value *EmitBuiltinSQRT(gimple_statement_d *stmt);
-  llvm::Value *EmitBuiltinPOWI(gimple_statement_d *stmt);
-  llvm::Value *EmitBuiltinPOW(gimple_statement_d *stmt);
-  llvm::Value *EmitBuiltinLCEIL(gimple_statement_d *stmt);
-  llvm::Value *EmitBuiltinLFLOOR(gimple_statement_d *stmt);
-  llvm::Value *EmitBuiltinLROUND(gimple_statement_d *stmt);
-  llvm::Value *EmitBuiltinCEXPI(gimple_statement_d *stmt);
-  llvm::Value *EmitBuiltinSIGNBIT(gimple_statement_d *stmt);
+  EmitBuiltinBitCountIntrinsic(GimpleTy *stmt, llvm::Intrinsic::ID Id);
+  llvm::Value *EmitBuiltinSQRT(GimpleTy *stmt);
+  llvm::Value *EmitBuiltinPOWI(GimpleTy *stmt);
+  llvm::Value *EmitBuiltinPOW(GimpleTy *stmt);
+  llvm::Value *EmitBuiltinLCEIL(GimpleTy *stmt);
+  llvm::Value *EmitBuiltinLFLOOR(GimpleTy *stmt);
+  llvm::Value *EmitBuiltinLROUND(GimpleTy *stmt);
+  llvm::Value *EmitBuiltinCEXPI(GimpleTy *stmt);
+  llvm::Value *EmitBuiltinSIGNBIT(GimpleTy *stmt);
 
-  bool EmitBuiltinAdjustTrampoline(gimple_statement_d *stmt,
-                                   llvm::Value *&Result);
-  bool EmitBuiltinAlloca(gimple_statement_d *stmt, llvm::Value *&Result);
-  bool EmitBuiltinAllocaWithAlign(gimple_statement_d *stmt,
-                                  llvm::Value *&Result);
-#if (GCC_MINOR > 6)
-  bool EmitBuiltinAssumeAligned(gimple_statement_d *stmt, llvm::Value *&Result);
+  bool EmitBuiltinAdjustTrampoline(GimpleTy *stmt, llvm::Value *&Result);
+  bool EmitBuiltinAlloca(GimpleTy *stmt, llvm::Value *&Result);
+  bool EmitBuiltinAllocaWithAlign(GimpleTy *stmt, llvm::Value *&Result);
+#if GCC_VERSION_CODE > GCC_VERSION(4, 6)
+  bool EmitBuiltinAssumeAligned(GimpleTy *stmt, llvm::Value *&Result);
 #endif
-  bool EmitBuiltinBZero(gimple_statement_d *stmt, llvm::Value *&Result);
-  bool EmitBuiltinConstantP(gimple_statement_d *stmt, llvm::Value *&Result);
-  bool EmitBuiltinExpect(gimple_statement_d *stmt, llvm::Value *&Result);
-  bool EmitBuiltinExtendPointer(gimple_statement_d *stmt, llvm::Value *&Result);
-  bool EmitBuiltinExtractReturnAddr(gimple_statement_d *stmt,
+  bool EmitBuiltinBZero(GimpleTy *stmt, llvm::Value *&Result);
+  bool EmitBuiltinConstantP(GimpleTy *stmt, llvm::Value *&Result);
+  bool EmitBuiltinExpect(GimpleTy *stmt, llvm::Value *&Result);
+  bool EmitBuiltinExtendPointer(GimpleTy *stmt, llvm::Value *&Result);
+  bool EmitBuiltinExtractReturnAddr(GimpleTy *stmt,
                                     llvm::Value *&Result);
-  bool EmitBuiltinFrobReturnAddr(gimple_statement_d *stmt,
+  bool EmitBuiltinFrobReturnAddr(GimpleTy *stmt,
                                  llvm::Value *&Result);
-  bool EmitBuiltinInitTrampoline(gimple_statement_d *stmt, bool OnStack);
-  bool EmitBuiltinMemCopy(gimple_statement_d *stmt, llvm::Value *&Result,
+  bool EmitBuiltinInitTrampoline(GimpleTy *stmt, bool OnStack);
+  bool EmitBuiltinMemCopy(GimpleTy *stmt, llvm::Value *&Result,
                           bool isMemMove, bool SizeCheck);
-  bool EmitBuiltinMemSet(gimple_statement_d *stmt, llvm::Value *&Result,
+  bool EmitBuiltinMemSet(GimpleTy *stmt, llvm::Value *&Result,
                          bool SizeCheck);
-  bool EmitBuiltinPrefetch(gimple_statement_d *stmt);
-  bool EmitBuiltinReturnAddr(gimple_statement_d *stmt, llvm::Value *&Result,
+  bool EmitBuiltinPrefetch(GimpleTy *stmt);
+  bool EmitBuiltinReturnAddr(GimpleTy *stmt, llvm::Value *&Result,
                              bool isFrame);
-  bool EmitBuiltinStackRestore(gimple_statement_d *stmt);
-  bool EmitBuiltinStackSave(gimple_statement_d *stmt, llvm::Value *&Result);
+  bool EmitBuiltinStackRestore(GimpleTy *stmt);
+  bool EmitBuiltinStackSave(GimpleTy *stmt, llvm::Value *&Result);
   bool EmitBuiltinUnreachable();
-  bool EmitBuiltinVACopy(gimple_statement_d *stmt);
-  bool EmitBuiltinVAEnd(gimple_statement_d *stmt);
-  bool EmitBuiltinVAStart(gimple_statement_d *stmt);
+  bool EmitBuiltinVACopy(GimpleTy *stmt);
+  bool EmitBuiltinVAEnd(GimpleTy *stmt);
+  bool EmitBuiltinVAStart(GimpleTy *stmt);
 
-  bool EmitBuiltinEHCopyValues(gimple_statement_d *stmt);
-  bool EmitBuiltinEHFilter(gimple_statement_d *stmt, llvm::Value *&Result);
-  bool EmitBuiltinEHPointer(gimple_statement_d *stmt, llvm::Value *&Result);
-  bool EmitBuiltinDwarfCFA(gimple_statement_d *stmt, llvm::Value *&Result);
-  bool EmitBuiltinDwarfSPColumn(gimple_statement_d *stmt, llvm::Value *&Result);
-  bool EmitBuiltinEHReturnDataRegno(gimple_statement_d *stmt,
+  bool EmitBuiltinEHCopyValues(GimpleTy *stmt);
+  bool EmitBuiltinEHFilter(GimpleTy *stmt, llvm::Value *&Result);
+  bool EmitBuiltinEHPointer(GimpleTy *stmt, llvm::Value *&Result);
+  bool EmitBuiltinDwarfCFA(GimpleTy *stmt, llvm::Value *&Result);
+  bool EmitBuiltinDwarfSPColumn(GimpleTy *stmt, llvm::Value *&Result);
+  bool EmitBuiltinEHReturnDataRegno(GimpleTy *stmt,
                                     llvm::Value *&Result);
-  bool EmitBuiltinEHReturn(gimple_statement_d *stmt, llvm::Value *&Result);
-  bool EmitBuiltinInitDwarfRegSizes(gimple_statement_d *stmt,
+  bool EmitBuiltinEHReturn(GimpleTy *stmt, llvm::Value *&Result);
+  bool EmitBuiltinInitDwarfRegSizes(GimpleTy *stmt,
                                     llvm::Value *&Result);
-  bool EmitBuiltinUnwindInit(gimple_statement_d *stmt, llvm::Value *&Result);
+  bool EmitBuiltinUnwindInit(GimpleTy *stmt, llvm::Value *&Result);
 
   // Complex Math Expressions.
   llvm::Value *CreateComplex(llvm::Value *Real, llvm::Value *Imag);
@@ -693,10 +724,10 @@ private:
   LValue EmitLV_COMPONENT_REF(tree_node *exp);
   LValue EmitLV_DECL(tree_node *exp);
   LValue EmitLV_INDIRECT_REF(tree_node *exp);
-#if (GCC_MINOR > 5)
+#if GCC_VERSION_CODE > GCC_VERSION(4, 5)
   LValue EmitLV_MEM_REF(tree_node *exp);
 #endif
-#if (GCC_MINOR < 6)
+#if GCC_VERSION_CODE < GCC_VERSION(4, 6)
   LValue EmitLV_MISALIGNED_INDIRECT_REF(tree_node *exp);
 #endif
   LValue EmitLV_VIEW_CONVERT_EXPR(tree_node *exp);
@@ -763,7 +794,7 @@ private:
 
 private:
   // Optional target defined builtin intrinsic expanding function.
-  bool TargetIntrinsicLower(gimple_statement_d *stmt, tree_node *fndecl,
+  bool TargetIntrinsicLower(GimpleTy *stmt, tree_node *fndecl,
                             const MemRef *DestLoc, llvm::Value *&Result,
                             llvm::Type *ResultType,
                             std::vector<llvm::Value *> &Ops);

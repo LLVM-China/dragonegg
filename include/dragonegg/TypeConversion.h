@@ -30,11 +30,20 @@
 // Forward declarations.
 namespace llvm {
 class AttributeSet;
+#if LLVM_VERSION_CODE > LLVM_VERSION(3, 9)
+class AttributeList;
+#endif
 class FunctionType;
 class LLVMContext;
 class Type;
 }
 union tree_node;
+
+#if LLVM_VERSION_CODE > LLVM_VERSION(4, 0)
+typedef llvm::AttributeList MigAttributeSet;
+#else
+typedef llvm::AttributeSet MigAttributeSet;
+#endif
 
 //===----------------------------------------------------------------------===//
 //                                 Utilities
@@ -90,7 +99,7 @@ extern llvm::Type *ConvertType(tree_node *type);
 /// it also returns the function's LLVM calling convention and attributes.
 extern llvm::FunctionType *
 ConvertFunctionType(tree_node *type, tree_node *decl, tree_node *static_chain,
-                    llvm::CallingConv::ID &CC, llvm::AttributeSet &PAL);
+                    llvm::CallingConv::ID &CC, MigAttributeSet &PAL);
 
 /// ConvertArgListToFnType - Given a DECL_ARGUMENTS list on an GCC tree,
 /// return the LLVM type corresponding to the function.  This is useful for
@@ -98,6 +107,6 @@ ConvertFunctionType(tree_node *type, tree_node *decl, tree_node *static_chain,
 llvm::FunctionType *ConvertArgListToFnType(
     tree_node *type, llvm::ArrayRef<tree_node *> arglist,
     tree_node *static_chain, bool KNRPromotion, llvm::CallingConv::ID &CC,
-    llvm::AttributeSet &PAL);
+    MigAttributeSet &PAL);
 
 #endif /* DRAGONEGG_TYPES_H */

@@ -310,6 +310,27 @@ extern const char *llvm_x86_override_target_environment();
 #define LLVM_CANONICAL_ADDRESS_CONSTRAINTS "im"
 
 /* Propagate code model setting to backend */
+#if LLVM_VERSION_MAJOR > 5
+#define LLVM_SET_CODE_MODEL(CMModel)                                           \
+  switch (ix86_cmodel) {                                                       \
+  case CM_32:                                                                  \
+  case CM_SMALL:                                                               \
+  case CM_SMALL_PIC:                                                           \
+    CMModel = CodeModel::Small;                                                \
+    break;                                                                     \
+  case CM_KERNEL:                                                              \
+    CMModel = CodeModel::Kernel;                                               \
+    break;                                                                     \
+  case CM_MEDIUM:                                                              \
+  case CM_MEDIUM_PIC:                                                          \
+    CMModel = CodeModel::Medium;                                               \
+    break;                                                                     \
+  case CM_LARGE:                                                               \
+  case CM_LARGE_PIC:                                                           \
+    CMModel = CodeModel::Large;                                                \
+    break;                                                                     \
+  }
+#else
 #define LLVM_SET_CODE_MODEL(CMModel)                                           \
   switch (ix86_cmodel) {                                                       \
   case CM_32:                                                                  \
@@ -331,6 +352,7 @@ extern const char *llvm_x86_override_target_environment();
     CMModel = CodeModel::Large;                                                \
     break;                                                                     \
   }
+#endif
 
 #define LLVM_SET_MACHINE_OPTIONS(argvec)                                       \
   do {                                                                         \

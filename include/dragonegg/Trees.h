@@ -23,7 +23,7 @@
 #ifndef DRAGONEGG_TREES_H
 #define DRAGONEGG_TREES_H
 
-#if (GCC_MINOR < 7)
+#if (GCC_MAJOR < 5 && GCC_MINOR < 7)
 #include "flags.h" // For TYPE_OVERFLOW_UNDEFINED.
 #endif
 
@@ -39,6 +39,11 @@
 // The following properties must hold if dragonegg is to work correctly.
 #if ((BITS_PER_UNIT & 7) != 0)
 #error BITS_PER_UNIT must be a multiple of 8
+#endif
+
+#if LLVM_VERSION_MAJOR > 4
+using integerPart = uint64_t;
+const unsigned int integerPartWidth = 8 * static_cast<unsigned int>(sizeof(integerPart));
 #endif
 
 /// dragonegg_tree_code - Fake helper tree codes.
@@ -142,7 +147,7 @@ unsigned getFieldAlignment(const_tree field);
 bool isBitfield(const_tree field_decl);
 
 // Compatibility hacks for older versions of GCC.
-#if (GCC_MINOR < 8)
+#if (GCC_MAJOR < 5 && GCC_MINOR < 8)
 // Supported allocation types:
 struct va_gc {
 }; // Allocation uses ggc_alloc.
